@@ -213,7 +213,7 @@ methodImplNameStr clazz mname =
 
 forwardingMethodImplNameStr :: Ty.Type -> ID.Name -> String
 forwardingMethodImplNameStr clazz mname =
-  encoreName "forwarding_method" $ qualifyRefType clazz ++ "_" ++ show mname
+  encoreName "method" $ qualifyRefType clazz ++ "_" ++ show mname ++ "_async"
 
 callMethodFutureNameStr :: Ty.Type -> ID.Name -> String
 callMethodFutureNameStr clazz mname =
@@ -348,7 +348,7 @@ streamHandle = Var "_stream"
 
 typeVarRefName :: Ty.Type -> CCode Name
 typeVarRefName ty =
-    Nam $ encoreName "type" (show ty)
+    Nam $ encoreName "type" (getId ty)
 
 classId :: Ty.Type -> CCode Name
 classId ty =
@@ -403,10 +403,8 @@ oneWayMsgId cls mname =
 
 typeNamePrefix :: Ty.Type -> String
 typeNamePrefix ref
-  | Ty.isActiveClassType ref = encoreName "active" qname
-  | Ty.isSharedClassType ref = encoreName "shared" qname
-  | Ty.isPassiveClassType ref = encoreName "passive" qname
   | Ty.isTraitType ref = encoreName "trait" qname
+  | Ty.isRefAtomType ref = encoreName "class" qname
   | otherwise = error $ "type_name_prefix Type '" ++ show ref ++
                         "' isnt reference type!"
   where
@@ -450,6 +448,9 @@ futureGetActor = Nam "future_get_actor"
 
 futureChainActor :: CCode Name
 futureChainActor = Nam "future_chain_actor"
+
+futureChainActorForward :: CCode Name
+futureChainActorForward = Nam "future_chain_forward"
 
 actorSuspend :: CCode Name
 actorSuspend = Nam "actor_suspend"

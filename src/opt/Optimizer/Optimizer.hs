@@ -3,6 +3,7 @@ module Optimizer.Optimizer(optimizeProgram) where
 import Identifiers
 import AST.AST
 import AST.Util
+import qualified AST.Meta as Meta
 import Types
 import Control.Applicative (liftA2)
 
@@ -18,8 +19,26 @@ optimizeProgram p@(Program{classes, traits, functions}) =
       optimizeTrait t@(Trait{tmethods}) =
           t{tmethods = map optimizeMethod tmethods}
 
-      optimizeClass c@(Class{cmethods}) =
-          c{cmethods = map optimizeMethod cmethods}
+      optimizeClass c@(Class{cname, cmethods})
+        | isMainClass c =
+            c{cmethods = map (optimizeMethod . addMainInitCall) cmethods}
+        | otherwise =
+            c{cmethods = map optimizeMethod cmethods}
+        where
+          addMainInitCall m@Method{mbody}
+            | isMainMethod cname (methodName m) =
+                let em = emeta mbody
+                    this = setType cname
+                           VarAccess{emeta = em, qname = qLocal thisName}
+                    initCall = setType unitType
+                               MethodCall{emeta = em
+                                         ,target = this
+                                         ,name = constructorName
+                                         ,typeArguments = []
+                                         ,args = []
+                                         }
+                in m{mbody = Seq{emeta = emeta mbody, eseq = [initCall, mbody]}}
+            | otherwise = m
 
       optimizeMethod m =
           m{mbody = optimizeExpr (mbody m)}
@@ -29,8 +48,8 @@ optimizeProgram p@(Program{classes, traits, functions}) =
 
 -- | The functions in this list will be performed in order during optimization
 optimizerPasses :: [Expr -> Expr]
-optimizerPasses = [constantFolding, constructors,
-                   sugarPrintedStrings, tupleMaybeIdComparison]
+optimizerPasses = [constantFolding, sugarPrintedStrings, tupleMaybeIdComparison,
+                   dropBorrowBlocks, forwardGeneral]
 
 -- Note that this is not intended as a serious optimization, but
 -- as an example to how an optimization could be made. As soon as
@@ -44,22 +63,6 @@ constantFolding = extend foldConst
                         roper = IntLiteral{intLit = n}}) =
           IntLiteral{emeta = meta, intLit = m + n}
       foldConst e = e
-
--- Calls to init are necessarily constructor calls and should
--- therefore be future-less message sends.
-constructors :: Expr -> Expr
-constructors = extend constr
-    where
-      constr e@(MethodCall {name, emeta, target, args})
-          | name == constructorName &&
-            (liftA2 (||) isActiveClassType isSharedClassType . getType) target =
-              MessageSend {name = constructorName
-                          ,emeta = emeta
-                          ,target = target
-                          ,args = args
-                          ,typeArguments = []}
-          | otherwise = e
-      constr e = e
 
 -- Desugars a == b when a : Just[t] and b : Just[t] into
 -- match (a, b) with
@@ -132,6 +135,43 @@ sugarPrintedStrings = extend sugarPrintedString
       simplifyStringLit arg
         | NewWithInit{ty} <- arg
         , isStringObjectType ty
-        , Just sugared <- getSugared arg
+        , Just sugared@StringLiteral{} <- getSugared arg
           = setType stringType sugared
         | otherwise = arg
+
+dropBorrowBlocks = extend dropBorrowBlock
+    where
+      dropBorrowBlock e@Borrow{emeta, target, name, body} =
+        Let{emeta
+           ,mutability = Val
+           ,decls = [([VarNoType name], target)]
+           ,body}
+      dropBorrowBlock e = e
+
+forwardGeneral = extend forwardGeneral'
+  where
+    forwardGeneral' e@(Forward{forwardExpr=MessageSend{}}) = e
+
+    forwardGeneral' e@(Forward{forwardExpr=FutureChain{}}) = e
+
+    forwardGeneral' e@(Forward{emeta, forwardExpr}) =
+      Forward{emeta=emeta', forwardExpr=newExpr}
+      where
+         emeta' = Meta.setType (Meta.getType emeta) (Meta.meta $ Meta.getPos emeta)
+         newExpr = FutureChain{emeta=fcmeta, future=forwardExpr, chain=idfun}
+         fcmeta = Meta.setType (getType $ forwardExpr) (Meta.meta (Meta.getPos emeta'))
+         idfun = Closure {emeta=mclosure
+                          ,eparams=[pdecl]
+                          ,mty=Just closureType
+                          ,body=VarAccess {emeta=Meta.setType paramType mclosure
+                                            ,qname=qName "_id_fun_tmp"}}
+         closureType = arrowType [paramType] paramType
+         mclosure = Meta.metaClosure "" (Meta.setType closureType emeta)
+         paramType = getResultType . getType $ forwardExpr
+         pdecl = Param {pmeta=Meta.setType paramType (Meta.meta (Meta.getPos emeta))
+                        ,pmut =Val
+                        ,pname=Name "_id_fun_tmp"
+                        ,ptype=paramType
+                        ,pdefault= Nothing}
+
+    forwardGeneral' e = e

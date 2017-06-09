@@ -139,11 +139,13 @@ ppFunction Function {funheader, funbody, funlocals} =
 
 ppTraitDecl :: TraitDecl -> Doc
 ppTraitDecl Trait {tname, treqs, tmethods} =
-    "trait" <+> ppType tname $+$
+    trait <+> text (showWithoutMode tname) $+$
         indent (vcat (map ppRequirement treqs) $$
                 vcat (map ppMethodDecl tmethods)) $+$
     "end"
   where
+    trait | isModeless tname = "trait"
+          | otherwise = text $ showModeOf tname ++ " trait"
     ppRequirement RequiredField{rfield} =
       "require" <+> ppFieldDecl rfield
     ppRequirement RequiredMethod{rheader} =
@@ -168,14 +170,13 @@ ppComposition TraitLeaf{tcname, tcext} =
 
 ppClassDecl :: ClassDecl -> Doc
 ppClassDecl Class {cname, cfields, cmethods, ccomposition} =
-    clss <+> ppType cname <+> compositionDoc $+$
+    clss <+> text (showWithoutMode cname) <+> compositionDoc $+$
         indent (vcat (map ppFieldDecl cfields) $$
                 vcat (map ppMethodDecl cmethods)) $+$
     "end"
   where
-    clss | isPassiveClassType cname = "passive class"
-         | isSharedClassType cname = "shared class"
-         | otherwise = "class"
+    clss | isModeless cname = "class"
+         | otherwise = text $ showModeOf cname ++ " class"
     compositionDoc =
       case ccomposition of
         Just c -> ":" <+> ppComposition c
@@ -272,11 +273,6 @@ ppExpr MessageSend {target, name, args, typeArguments} =
     maybeParens target <> "!" <> ppName name <>
       withTypeArguments typeArguments <>
       parens (commaSep (map ppExpr args))
-ppExpr Liftf {val} = "liftf" <> parens (ppExpr val)
-ppExpr Liftv {val} = "liftv" <> parens (ppExpr val)
-ppExpr PartyJoin {val} = "join" <> parens (ppExpr val)
-ppExpr PartyExtract {val} = "extract" <> parens(ppExpr val)
-ppExpr PartyEach {val} = "each" <> parens(ppExpr val)
 ppExpr PartySeq {par, seqfunc} = ppExpr par <+> ">>" <+> parens (ppExpr seqfunc)
 ppExpr PartyPar {parl, parr} = ppExpr parl <+> "|||" <+> ppExpr parr
 ppExpr PartyReduce {seqfun, pinit, par} = "reduce" <>
@@ -312,12 +308,12 @@ ppExpr (MaybeValue _ NothingData) = "Nothing"
 ppExpr Tuple {args} = parens (commaSep (map ppExpr args))
 ppExpr Let {decls, body} =
   "let" $+$
-      indent (vcat (map (\(Name x, e) -> text x <+> "=" <+> ppExpr e) decls)) $+$
+      indent (vcat (map ppDecl decls)) $+$
   "in" $+$
       indent (ppBody body) $+$
   "end"
-ppExpr MiniLet {mutability, decl = (x, val)} =
-    ppMut mutability <+> ppName x <+> "=" <+> ppExpr val
+ppExpr MiniLet {mutability, decl} =
+    ppMut mutability <+> ppDecl decl
 ppExpr Seq {eseq = [expr]} = ppExpr expr
 ppExpr Seq {eseq} =
     "do" $+$
@@ -372,6 +368,10 @@ ppExpr Match {arg, clauses} =
           indent (ppBody mchandler) $+$
         "end"
       ppMatchClauses = foldr (($+$) . indent . ppClause) ""
+ppExpr Borrow {target, name, body} =
+    "borrow" <+> ppExpr target <+> "as" <+> ppName name <+> "in" $+$
+      indent (ppBody body) $+$
+    "end"
 ppExpr FutureChain {future, chain} =
     ppExpr future <+> "~~>" <+> ppExpr chain
 ppExpr Get {val} = "get" <> parens (ppExpr val)
@@ -393,6 +393,7 @@ ppExpr ArrayNew {ty, size} = "new" <+> brackets (ppType ty) <> parens (ppExpr si
 ppExpr ArrayLiteral {args} = brackets $ commaSep (map ppExpr args)
 ppExpr VarAccess {qname} = ppQName qname
 ppExpr TupleAccess {target, compartment} = ppExpr target <> "." <> int compartment
+ppExpr Consume {target} = "consume" <+> ppExpr target
 ppExpr Assign {lhs, rhs} = ppExpr lhs <+> "=" <+> ppExpr rhs
 ppExpr Null {} = "null"
 ppExpr BTrue {} = "true"
@@ -424,6 +425,14 @@ ppExpr Unary {uop, operand} = ppUnary uop <> parens (ppExpr operand)
 ppExpr Binop {binop, loper, roper} =
   ppExpr loper <+> ppBinop binop <+> ppExpr roper
 ppExpr TypedExpr {body, ty} = ppExpr body <+> ":" <+> ppType ty
+
+ppDecl :: ([VarDecl], Expr) -> Doc
+ppDecl (vars, val) =
+  commaSep (map ppVar vars) <+> "=" <+> ppExpr val
+ppVar :: VarDecl -> Doc
+ppVar (VarType x ty) = ppName x <+> ":" <+> ppType ty
+ppVar (VarNoType x) = ppName x
+
 
 ppUnary :: UnaryOp -> Doc
 ppUnary Identifiers.NOT = "not"

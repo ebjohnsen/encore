@@ -8,11 +8,11 @@ fun replicate[t](counter : int, item : t, acc : [t]) : [t]
     replicate(counter - 1, item, acc)
   end
 end
-class Test
-  def id[t](x : t) : t
+active class Test
+  def id[sharable t](x : t) : t
     x
   end
-  def replicate[t](counter : int, item : t) : [t]
+  def replicate[sharable t](counter : int, item : t) : [t]
     let
       ar = new [t](counter)
     in
@@ -20,12 +20,12 @@ class Test
     end
   end
 end
-passive class TestPassive
+read class TestPassive
   def id[t](x : t) : t
     x
   end
 end
-class Main
+active class Main
   var a : Test
   var p : TestPassive
   def testIdInference() : unit

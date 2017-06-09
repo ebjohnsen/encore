@@ -20,13 +20,14 @@ import Data.Maybe(fromMaybe, isJust, fromJust)
 import Control.Monad(void, foldM, unless, when, liftM)
 import Control.Monad.Reader hiding(guard)
 import Control.Applicative ((<$>), empty)
-import Control.Arrow (first)
+import Control.Arrow (first, (&&&))
 
 -- Module dependencies
 import Identifiers hiding(namespace)
 import Types hiding(refType)
 import AST.AST
-import AST.Meta hiding(Closure, Async, getPos)
+import AST.Meta hiding(Closure, Async, getPos, setEndPos)
+import qualified AST.Meta as Meta(setEndPos)
 
 -- | 'parseEncoreProgram' @path@ @code@ assumes @path@ is the path
 -- to the file being parsed and will produce an AST for @code@,
@@ -169,7 +170,15 @@ blockedConstruct header = do
     constructor <- header
     parseBody constructor
   atLevel indent $ reserved "end"
-  return block
+  returnWithEnd block
+
+returnWithEnd :: HasMeta a => a -> EncParser a
+returnWithEnd x = do
+  end <- getPosition
+  return $ setEndPos end x
+
+buildMeta :: HasMeta a => EncParser (Meta a)
+buildMeta = meta . newPos <$> getPosition
 
 -- | These parsers use the lexer above and are the smallest
 -- building blocks of the whole parser.
@@ -180,12 +189,16 @@ reservedNames =
     ,"Maybe"
     ,"Par"
     ,"Stream"
+    ,"active"
     ,"and"
     ,"bool"
     ,"break"
+    ,"borrow"
+    ,"borrowed"
     ,"case"
     ,"char"
     ,"class"
+    ,"consume"
     ,"continue"
     ,"def"
     ,"do"
@@ -201,13 +214,13 @@ reservedNames =
     ,"in"
     ,"int"
     ,"let"
+    ,"linear"
     ,"match"
     ,"module"
     ,"new"
     ,"not"
     ,"null"
     ,"or"
-    ,"passive"
     ,"qualified"
     ,"real"
     ,"repeat"
@@ -222,6 +235,7 @@ reservedNames =
     ,"typedef"
     ,"uint"
     ,"unless"
+    ,"unsafe"
     ,"val"
     ,"var"
     ,"unit"
@@ -323,11 +337,17 @@ typ = makeExprParser singleType opTable
       opTable = [
                  [typeOp "*" conjunctiveType],
                  [typeOp "+" disjunctiveType],
+                 [typeConstructor "borrowed" makeStackbound],
                  [arrow]
                 ]
       typeOp op constructor =
           InfixL (do withLinebreaks $ reservedOp op
                      return constructor)
+
+      typeConstructor name constructor =
+          Prefix (do reserved name
+                     return constructor)
+
       arrow =
           InfixR (do withLinebreaks $ reservedOp "->"
                      return (arrowType . unfoldArgs))
@@ -342,8 +362,9 @@ typ = makeExprParser singleType opTable
         <|> embed
         <|> range
         <|> builtin
-        <|> refType
         <|> primitive
+        <|> try modedArrow
+        <|> refType
         <|> typeVariable
         <|> parenthesized
         <?> "type"
@@ -373,14 +394,25 @@ typ = makeExprParser singleType opTable
           par    = builtin' parType "Par"
           stream = builtin' streamType "Stream"
       refType = do
+        setMode <- option id mode
         full <- modulePath
         let ns = explicitNamespace $ init full
             refId = show $ last full
         parameters <- option [] $ brackets (commaSep1 typ)
         if isEmptyNamespace ns
-        then return $ refTypeWithParams refId parameters
-        else return $ setRefNamespace ns $
+        then return $ setMode $ refTypeWithParams refId parameters
+        else return $ setMode $ setRefNamespace ns $
                       refTypeWithParams refId parameters
+      modedArrow = do
+        modes <- some mode
+        ty <- parens arrow
+        return $ foldr ($) ty modes
+        where
+          arrow = do
+            args <- parens (commaSep typ) <|> liftM (:[]) typ
+            reservedOp "->"
+            result <- typ
+            return $ arrowType args result
       primitive =
         do {reserved "int"; return intType} <|>
         do {reserved "uint"; return uintType} <|>
@@ -393,8 +425,7 @@ typ = makeExprParser singleType opTable
 typeVariable :: EncParser Type
 typeVariable = do
   notFollowedBy upperChar
-  id <- identifier
-  return $ typeVar id
+  typeVar <$> identifier
   <?> "lower case type variable"
 
 data ADecl = CDecl{cdecl :: ClassDecl} | TDecl{tdecl :: TraitDecl} | TDef{tdef :: Typedef} | FDecl{fdecl :: Function}
@@ -447,22 +478,23 @@ program = do
 moduleDecl :: EncParser ModuleDecl
 moduleDecl = option NoModule $
   lineFold $ \sc' -> do
-    modmeta <- meta <$> getPosition
+    modmeta <- buildMeta
     reserved "module"
     lookAhead upperChar
     modname <- Name <$> identifier
     modexports <- optional $
                   folded parens sc' ((Name <$> identifier) `sepEndBy` comma)
-    return Module{modmeta
-                 ,modname
-                 ,modexports
-                 }
+    returnWithEnd
+      Module{modmeta
+            ,modname
+            ,modexports
+            }
 
 importdecl :: EncParser ImportDecl
 importdecl =
   lineFold $ \sc' -> do
     indent <- L.indentLevel
-    imeta <- meta <$> getPosition
+    imeta <- buildMeta
     reserved "import"
     iqualified <- option False $ reserved "qualified" >> return True
     itarget <- explicitNamespace <$> modulePath
@@ -476,35 +508,49 @@ importdecl =
                  try sc'
                  reserved "hiding"
                  folded parens sc' ((Name <$> identifier) `sepEndBy` comma)
-    return Import{imeta
-                 ,itarget
-                 ,iqualified
-                 ,iselect
-                 ,ihiding
-                 ,ialias
-                 ,isource = Nothing
-                 }
+    returnWithEnd
+      Import{imeta
+            ,itarget
+            ,iqualified
+            ,iselect
+            ,ihiding
+            ,ialias
+            ,isource = Nothing
+            }
 
 embedTL :: EncParser EmbedTL
 embedTL = do
   -- TODO: Make sure BODY and END are not indented
-  pos <- getPosition
-  (try (do string "EMBED"
-           header <- manyTill anyChar $ try $ do {spaceChar; string "BODY"}
-           code <- manyTill anyChar $ try $ do {spaceChar; reserved "END"}
-           return $ EmbedTL (meta pos) header code
-       ) <|>
-   try (do string "EMBED"
-           header <- manyTill anyChar $ try $ do {spaceChar; reserved "END"}
-           return $ EmbedTL (meta pos) header ""
-       ) <|>
-   (return $ EmbedTL (meta pos) "" ""))
+  etlmeta <- buildMeta
+  try (embedWithBody etlmeta) <|> try (embedWithoutBody etlmeta) <|>
+   return EmbedTL{etlmeta
+                 ,etlheader = ""
+                 ,etlbody = ""}
+  where
+    embedWithBody etlmeta = do
+      string "EMBED"
+      etlheader <- manyTill anyChar $ try $ do {spaceChar; string "BODY"}
+      etlbody <- manyTill anyChar $ try $ do {spaceChar; reserved "END"}
+      return EmbedTL{etlmeta
+                    ,etlheader
+                    ,etlbody}
+    embedWithoutBody etlmeta = do
+      string "EMBED"
+      etlheader <- manyTill anyChar $ try $ do {spaceChar; reserved "END"}
+      return EmbedTL{etlmeta
+                    ,etlheader
+                    ,etlbody = ""}
 
-optionalTypeParameters = option [] (brackets $ commaSep1 typ)
+optionalTypeParameters = option [] (brackets $ commaSep1 modedTypeVar)
+  where
+    modedTypeVar = do
+      setMode <- option id mode
+      typeVar <- typeVariable
+      return $ setMode typeVar
 
 typedef :: EncParser Typedef
 typedef = do
-  typedefmeta <- meta <$> getPosition
+  typedefmeta <- buildMeta
   indent <- L.indentLevel
   reserved "typedef"
   name <- lookAhead upperChar >> identifier
@@ -513,7 +559,7 @@ typedef = do
   typedeftype <- typ <|> (hidden nl >> indented indent typ)
   let typedefdef = setRefNamespace emptyNamespace $
                    typeSynonym name params typedeftype
-  return Typedef{typedefmeta, typedefdef}
+  returnWithEnd Typedef{typedefmeta, typedefdef}
 
 functionHeader :: EncParser FunctionHeader
 functionHeader =
@@ -523,13 +569,14 @@ functionHeader =
     hparams <- folded parens sc' (commaSep paramDecl)
     colon
     htype <- typ
-    return Header{hmodifiers = []
-                 ,kind = NonStreaming
-                 ,htypeparams
-                 ,hname
-                 ,hparams
-                 ,htype
-                 }
+    return
+      Header{hmodifiers = []
+            ,kind = NonStreaming
+            ,htypeparams
+            ,hname
+            ,hparams
+            ,htype
+            }
 
 streamMethodHeader :: EncParser FunctionHeader
 streamMethodHeader = do
@@ -552,7 +599,7 @@ localFunction = do
   funIndent <- L.indentLevel
   fun <- funHeaderAndBody
   atLevel funIndent $ reserved "end"
-  return fun
+  returnWithEnd fun
 
 globalFunction :: EncParser Function
 globalFunction = do
@@ -562,12 +609,11 @@ globalFunction = do
   funlocals <- option [] $ atLevel funIndent whereClause
 
   atLevel funIndent $ reserved "end"
-
-  return fun{funlocals}
+  returnWithEnd fun{funlocals}
 
 funHeaderAndBody =
   indentBlock $ do
-    funmeta <- meta <$> getPosition
+    funmeta <- buildMeta
     reserved "fun"
     funheader <- functionHeader
     alignedExpressions (buildFun funmeta funheader)
@@ -599,22 +645,40 @@ partitionTraitAttributes = partitionTraitAttributes' [] []
     partitionTraitAttributes' rs ms (TMethodAttribute{tmdecl}:as) =
       partitionTraitAttributes' rs (tmdecl:ms) as
 
+mode :: EncParser (Type -> Type)
+mode = (reserved "linear" >> return makeLinear)
+       <|>
+       (reserved "local" >> return makeLocal)
+       <|>
+       (reserved "active" >> return makeActive)
+       <|>
+       (reserved "shared" >> return makeShared)
+       <|>
+       (reserved "sharable" >> return makeSharable)
+       <|>
+       (reserved "unsafe" >> return makeUnsafe)
+       <|>
+       (reserved "read" >> return makeRead)
+       <|>
+       (reserved "subord" >> return makeSubordinate)
+       <?> "mode"
 
 traitDecl :: EncParser TraitDecl
 traitDecl = do
   tIndent <- L.indentLevel
   tdecl <- indentBlock $ do
-    tmeta <- meta <$> getPosition
+    tmeta <- buildMeta
+    setMode <- option id mode
     reserved "trait"
     ident <- lookAhead upperChar >> identifier
     params <- optionalTypeParameters
     return $ L.IndentMany
                Nothing
-               (buildTrait tmeta ident params)
+               (buildTrait tmeta setMode ident params)
                traitAttribute
   -- TODO: tlocals <- option [] $ atLevel tIndent whereClause
   atLevel tIndent $ reserved "end"
-  return tdecl
+  returnWithEnd tdecl
   where
     traitAttribute = label "requirement"
                      (TReqAttribute <$> requirement)
@@ -629,13 +693,13 @@ traitDecl = do
     reqField = do
       rfield <- fieldDecl
       return RequiredField{rfield}
-    buildTrait tmeta ident params attributes =
+    buildTrait tmeta setMode ident params attributes =
       let (treqs, tmethods) = partitionTraitAttributes attributes
       in
         return Trait{tmeta
-                    ,tname = setRefNamespace emptyNamespace $
-                             traitTypeFromRefType $
-                             refTypeWithParams ident params
+                    ,tname = setMode $
+                             setRefNamespace emptyNamespace $
+                             traitType ident params
                     ,treqs
                     ,tmethods
                     }
@@ -656,6 +720,7 @@ traitComposition = makeExprParser includedTrait opTable
         <|> parens traitComposition
         <?> "trait-inclusion"
       trait = do
+        setMode <- option id mode
         notFollowedBy lowerChar
         full <- modulePath
         let ns = explicitNamespace $ init full
@@ -663,11 +728,9 @@ traitComposition = makeExprParser includedTrait opTable
         parameters <- option [] $ brackets (commaSep1 typ)
         tcext <- option [] $ parens (commaSep1 extension)
         let tcname = if isEmptyNamespace ns
-                     then traitTypeFromRefType $
-                          refTypeWithParams refId parameters
-                     else setRefNamespace ns $
-                          traitTypeFromRefType $
-                          refTypeWithParams refId parameters
+                     then setMode $ traitType refId parameters
+                     else setMode $ setRefNamespace ns $
+                          traitType refId parameters
         return TraitLeaf{tcname, tcext}
         where
           extension = do
@@ -695,31 +758,31 @@ classDecl :: EncParser ClassDecl
 classDecl = do
   cIndent <- L.indentLevel
   cdecl <- indentBlock $ do
-    cmeta <- meta <$> getPosition
-    activity <- parseActivity
-    reserved "class"
+    cmeta <- buildMeta
+    setMode <-
+      try $ do m <- option id mode
+               reserved "class"
+               return m
     name <- lookAhead upperChar >> identifier
     params <- optionalTypeParameters
     ccomposition <- optional (do{colon; traitComposition})
     return $ L.IndentMany
                Nothing
-               (buildClass cmeta activity name params ccomposition)
+               (buildClass cmeta setMode name params ccomposition)
                classAttribute
   -- TODO: clocals <- option [] $ atLevel cIndent whereClause
   atLevel cIndent $ reserved "end"
-  return cdecl
+  returnWithEnd cdecl
   where
-    parseActivity = (reserved "shared" >> return Shared)
-      <|> (reserved "passive" >> return Passive)
-      <|> return Active
     classAttribute = (FieldAttribute <$> fieldDecl)
                  <|> (MethodAttribute <$> methodDecl)
-    buildClass cmeta activity name params ccomposition attributes =
+    buildClass cmeta setMode name params ccomposition attributes =
       let (cfields, cmethods) = partitionClassAttributes attributes
       in
         return Class{cmeta
-                    ,cname = setRefNamespace emptyNamespace $
-                             classType activity name params
+                    ,cname = setMode $
+                             setRefNamespace emptyNamespace $
+                             classType name params
                     ,ccomposition
                     ,cfields
                     ,cmethods
@@ -729,27 +792,35 @@ mutModifier :: EncParser Mutability
 mutModifier = (reserved "var" >> return Var)
           <|> (reserved "val" >> return Val)
 
+
 fieldDecl :: EncParser FieldDecl
-fieldDecl = do fmeta <- meta <$> getPosition
+fieldDecl = do fmeta <- buildMeta
                fmut  <- mutModifier
                fname <- Name <$> identifier
                colon
                ftype <- typ
-               return Field{fmeta
+               optional $ withLinebreaks $ reservedOp "="
+               fexpr <- optional expression
+               returnWithEnd Field{fmeta
                            ,fmut
                            ,fname
-                           ,ftype}
+                           ,ftype
+                           ,fexpr
+                         }
+
 
 paramDecl :: EncParser ParamDecl
 paramDecl = do
-  pmeta <- meta <$> getPosition
+  pmeta <- buildMeta
   pmut <- option Val $
               (reserved "var" >> return Var)
           <|> (reserved "val" >> return Val)
   pname <- Name <$> identifier
   colon
   ptype <- typ
-  return Param{pmeta, pmut, pname, ptype}
+  optional $ reservedOp "="
+  pdefault <- optional expression
+  returnWithEnd Param{pmeta, pmut, pname, ptype, pdefault}
 
 patternParamDecl :: EncParser (Expr, Type)
 patternParamDecl = do
@@ -765,11 +836,11 @@ methodDecl = do
 
   mlocals <- option [] $ atLevel mIndent whereClause
   atLevel mIndent $ reserved "end"
-  return mtd{mlocals}
+  returnWithEnd mtd{mlocals}
   where
     methodHeaderAndBody =
       indentBlock $ do
-        mmeta <- meta <$> getPosition
+        mmeta <- buildMeta
         mheader <- do reserved "def"
                       modifiers <- many modifier
                       setHeaderModifier modifiers <$> functionHeader
@@ -778,6 +849,7 @@ methodDecl = do
         alignedExpressions (buildMethod mmeta mheader)
     buildMethod mmeta mheader block =
       return Method{mmeta
+                   ,mimplicit = False
                    ,mheader
                    ,mbody = makeBody block
                    ,mlocals = []
@@ -804,7 +876,7 @@ matchClause = do
   (needsEnd, clause) <- indentBlock $ do
     reserved "case"
     mcpattern <- expression <|> dontCare
-    guardMeta <- meta <$> getPosition
+    guardMeta <- buildMeta
     mcguard <- option (BTrue guardMeta) guard
     reservedOp "=>"
     lineClause mcpattern mcguard <|> blockClause mcpattern mcguard
@@ -823,9 +895,9 @@ matchClause = do
                                             ,mchandler = makeBody body
                                            }))
     dontCare = do
-      emeta <- meta <$> getPosition
+      emeta <- buildMeta
       symbol "_"
-      return VarAccess{emeta, qname = qName "_"}
+      returnWithEnd VarAccess{emeta, qname = qName "_"}
 
 expression :: EncParser Expr
 expression = makeExprParser expr opTable
@@ -844,6 +916,7 @@ expression = makeExprParser expr opTable
                   op "||" Identifiers.OR],
                  [arrayAccess],
                  [messageSend],
+                 [consume],
                  [typedExpression],
                  [singleLineTask],
                  [chain],
@@ -854,68 +927,69 @@ expression = makeExprParser expr opTable
                   op "/=" DIV_EQUALS]
                 ]
 
+      withEnd p = do
+        emeta <- buildMeta
+        x <- p
+        end <- getPosition
+        return (Meta.setEndPos end emeta, x)
+
       textualPrefix s operator =
-          Prefix (try(do pos <- getPosition
-                         reserved s
-                         return (Unary (meta pos) operator)))
+          Prefix (try(do (emeta, _) <- withEnd $ reserved s
+                         return (Unary emeta operator)))
       prefix s operator =
-          Prefix (do pos <- getPosition
-                     reservedOp s
-                     return (Unary (meta pos) operator))
+          Prefix (do (emeta, _) <- withEnd $ reservedOp s
+                     return (Unary emeta operator))
       op s binop =
-          InfixL (do pos <- getPosition
-                     withLinebreaks $ reservedOp s
-                     return (Binop (meta pos) binop))
+          InfixL (do (emeta, _) <- withEnd . withLinebreaks $ reservedOp s
+                     return (Binop emeta binop))
 
       arrayAccess =
-          Postfix (do pos <- getPosition
-                      index <- parens expression
-                      return (\target -> ArrayAccess{emeta = meta pos
+          Postfix (do (emeta, index) <- withEnd $ parens expression
+                      return (\target -> ArrayAccess{emeta
                                                     ,target
                                                     ,index
                                                     }))
 
+      consume =
+          Prefix (do (emeta, _) <- withEnd $ reserved "consume"
+                     return (Consume emeta))
+
       typedExpression =
-          Postfix (do pos <- getPosition
-                      withLinebreaks colon
-                      t <- typ
-                      return (\e -> TypedExpr (meta pos) e t))
+          Postfix (do (emeta, ty) <- withEnd (withLinebreaks colon >> typ)
+                      return (\body -> TypedExpr{emeta
+                                                ,body
+                                                ,ty}))
       messageSend =
-          Postfix (do pos <- getPosition
-                      withLinebreaks bang
-                      name <- Name <$> identifier
-                      typeArguments <- option [] (try . brackets $ commaSep typ)
-                      args <- parens arguments
-                      let msgSend opt target = MessageSend {emeta = meta pos
-                                                           ,typeArguments
-                                                           ,target
-                                                           ,name
-                                                           ,args}
-                      return $ msgSend False)
+          Postfix (do (emeta, (name, typeArguments, args)) <- withEnd $ do
+                        withLinebreaks bang
+                        name <- Name <$> identifier
+                        typeArguments <-
+                          option [] (try . brackets $ commaSep typ)
+                        args <- parens arguments
+                        return (name, typeArguments, args)
+                      return (\target -> MessageSend{emeta
+                                                    ,typeArguments
+                                                    ,target
+                                                    ,name
+                                                    ,args}))
 
       singleLineTask =
         Prefix (do notFollowedBy (reserved "async" >> nl)
-                   emeta <- meta <$> getPosition
-                   reserved "async"
+                   (emeta, _) <- withEnd $ reserved "async"
                    return (Async emeta))
 
       chain =
-
-          InfixL (do pos <- getPosition
-                     withLinebreaks $ reservedOp "~~>"
-                     return (FutureChain (meta pos)))
+          InfixL (do (emeta, _) <- withEnd . withLinebreaks $ reservedOp "~~>"
+                     return (FutureChain emeta))
       partySequence =
-          InfixL (do pos <- getPosition ;
-                     reservedOp ">>" ;
-                     return (PartySeq (meta pos)))
+          InfixL (do (emeta, _) <- withEnd $ reservedOp ">>"
+                     return (PartySeq emeta))
       partyParallel =
-          InfixL (do pos <- getPosition ;
-                     reservedOp "|||" ;
-                     return (PartyPar (meta pos)))
+          InfixL (do (emeta, _) <- withEnd $ reservedOp "|||"
+                     return (PartyPar emeta))
       assignment =
-          InfixR (do pos <- getPosition ;
-                     reservedOp "=" ;
-                     return (Assign (meta pos)))
+          InfixR (do (emeta, _) <- withEnd $ reservedOp "="
+                     return (Assign emeta))
 
 -- Elias: I don't know why the first 'notFollowedBy nl' needed,
 -- but it improves error messages
@@ -926,6 +1000,7 @@ expr = notFollowedBy nl >>
      <|> continue
      <|> closure
      <|> match
+     <|> borrow
      <|> blockedTask
      <|> for
      <|> while
@@ -957,7 +1032,7 @@ expr = notFollowedBy nl >>
       embed = do
         indent <- L.indentLevel
         startLine <- sourceLine <$> getPosition
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         reserved "EMBED"
         ty <- label "parenthesized type" $
                     parens typ
@@ -970,13 +1045,13 @@ expr = notFollowedBy nl >>
         else atLevel indent $ reserved "END"
         when (null embedded) $
              fail "EMBED block cannot be empty"
-        return Embed{emeta, ty, embedded}
+        returnWithEnd Embed{emeta, ty, embedded}
         where
           cAndEncore :: EncParser (String, Expr)
           cAndEncore = (do
             notFollowedBy $ reserved "END"
             code <- c
-            emeta <- meta <$> getPosition
+            emeta <- buildMeta
             e <- option Skip{emeta}
                  (try $ encoreEscaped expression)
             return (code, e))
@@ -999,12 +1074,12 @@ expr = notFollowedBy nl >>
         longerPath pos root <|> return root
         where
           tupled = do
-            pos <- getPosition
+            emeta <- buildMeta
             args <- parens (expression `sepBy` comma)
             case args of
-              [] -> return $ Skip (meta pos)
+              [] -> returnWithEnd Skip{emeta}
               [e] -> return e
-              _ -> return $ Tuple (meta pos) args
+              _ -> returnWithEnd Tuple{emeta, args}
 
           qualifiedVarOrFun = do
             qx <- qualifiedVarAccess
@@ -1015,17 +1090,17 @@ expr = notFollowedBy nl >>
             functionOrCall x <|> return x
 
           qualifiedVarAccess = do
-            pos <- getPosition
+            emeta <- buildMeta
             ns <- explicitNamespace <$> modulePath
             dot
             x <- identifier
-            let qx = setNamespace ns (qName x)
-            return $ VarAccess (meta pos) qx
+            let qname = setNamespace ns (qName x)
+            returnWithEnd VarAccess{emeta, qname}
 
           varAccess = do
-            pos <- getPosition
-            id <- (do reserved "this"; return "this") <|> identifier
-            return $ VarAccess (meta pos) (qName id)
+            emeta <- buildMeta
+            qname <- qName <$> ((do reserved "this"; return "this") <|> identifier)
+            returnWithEnd VarAccess{emeta, qname}
 
           functionOrCall VarAccess{emeta, qname} = do
             optTypeArgs <- option [] (try . brackets $ commaSep typ)
@@ -1035,44 +1110,46 @@ expr = notFollowedBy nl >>
               call emeta optTypeArgs qname <|>
               return (FunctionAsValue emeta optTypeArgs qname)
 
-          call emeta typeArgs name = do
+          call emeta typeArguments qname = do
             args <- parens arguments
-            return $ FunctionCall emeta typeArgs name args
+            returnWithEnd FunctionCall{emeta, typeArguments, qname, args}
 
           longerPath pos root = do
             first <- pathComponent
             rest <- many $ try pathComponent
-            return $ foldl (buildPath pos) root (first:rest)
+            returnWithEnd $
+              foldl (buildPath pos) root (first:rest)
 
           pathComponent = do
-            emeta <- meta <$> getPosition
+            emeta <- buildMeta
             try comparmentAcc <|> try varOrCallFunction <|>
               optionalAccessBang emeta <|> optionalAccessDot emeta
             where
               optionalAccessBang emeta = do
                 reservedOp "?!"
                 m <- varAccess >>= functionCall
-                return $ Optional emeta (QuestionBang m)
+                returnWithEnd Optional{emeta, optTag = QuestionBang m}
               optionalAccessDot emeta = do
                 reservedOp "?."
                 var <- varOrCall
-                return $ Optional emeta (QuestionDot var)
+                returnWithEnd
+                  Optional{emeta, optTag = QuestionDot var}
               comparmentAcc = dot >> compartmentAccess
               varOrCallFunction = dot >> varOrCall
 
           compartmentAccess = do
-            pos <-  getPosition
-            n <- L.integer
-            return $ IntLiteral (meta pos) (fromInteger n)
+            emeta <- buildMeta
+            intLit <- fromInteger <$> lexeme L.integer
+            returnWithEnd IntLiteral{emeta, intLit}
 
           varOrCall = do
             x <- varAccess
             functionCall x <|> return x
 
           functionCall VarAccess{emeta, qname} = do
-            typeParams <- option [] (try . brackets $ commaSep typ)
+            typeArguments <- option [] (try . brackets $ commaSep typ)
             args <- parens arguments
-            return $ FunctionCall emeta typeParams qname args
+            returnWithEnd FunctionCall{emeta, typeArguments, qname, args}
 
           buildPath _ target o@Optional {emeta, optTag = QuestionBang f@(FunctionCall {})} =
             o {optTag = QuestionBang $ MessageSend emeta (typeArguments f) target (qnlocal $ qname f) (args f)}
@@ -1084,19 +1161,19 @@ expr = notFollowedBy nl >>
             o { optTag = QuestionDot $ FieldAccess emeta target (qnlocal qname) }
 
           buildPath pos target (VarAccess{qname}) =
-            FieldAccess (meta pos) target (qnlocal qname)
+            FieldAccess (meta $ newPos pos) target (qnlocal qname)
 
           buildPath pos target (FunctionCall{qname, args, typeArguments}) =
-            MethodCall (meta pos) typeArguments target (qnlocal qname) args
+            MethodCall (meta $ newPos pos) typeArguments target (qnlocal qname) args
 
           buildPath pos target (IntLiteral {intLit}) =
-            TupleAccess (meta pos) target intLit
+            TupleAccess (meta $ newPos pos) target intLit
 
       letExpression = do
         indent <- L.indentLevel
         letLine <- sourceLine <$> getPosition
         (needsEnd, letExpr) <- indentBlock $ do
-          emeta <- meta <$> getPosition
+          emeta <- buildMeta
           decls <- indentBlock $ do
             reserved "let"
             inlineDecls indent <|> indentedDecls indent
@@ -1112,7 +1189,7 @@ expr = notFollowedBy nl >>
             nonInlineLet indent emeta decls
         when needsEnd $
              atLevel indent $ reserved "end"
-        return letExpr
+        returnWithEnd letExpr
         where
           inlineDecls letIndent = do
             notFollowedBy nl
@@ -1137,39 +1214,47 @@ expr = notFollowedBy nl >>
                                            ,decls
                                            ,body
                                            })
+
       varDecl indent = do
-        x <- Name <$> identifier
+        vars <- commaSep1 var
         withLinebreaks $ reservedOp "="
         val <- indented indent expression
-        return (x, val)
+        return (vars, val)
+        where
+          var = do
+            x <- Name <$> identifier
+            t <- option Nothing (colon >> Just <$> typ)
+            case t of
+              Just ty -> return $ VarType x ty
+              Nothing -> return $ VarNoType x
 
       sequence = singleLineBlock <|> multiLineBlock
       singleLineBlock = do
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         eseq <- braces (expression `sepEndBy1` semi)
-        return Seq{emeta, eseq}
+        returnWithEnd Seq{emeta, eseq}
       multiLineBlock = do
         indent <- L.indentLevel
         block <- indentBlock $ do
-          emeta <- meta <$> getPosition
+          emeta <- buildMeta
           reserved "do"
           alignedExpressions (return . Seq emeta)
         doBlock indent block <|> doWhile indent block
       doBlock indent block = do
         atLevel indent $ reserved "end"
-        return block
+        returnWithEnd block
       doWhile indent body = do
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         atLevel indent $ reserved "while"
         cond <- expression
-        return DoWhile{emeta, cond, body}
+        returnWithEnd DoWhile{emeta, cond, body}
 
       miniLet = do
         indent <- L.indentLevel
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         mutability <- mutModifier
         (x, val) <- varDecl indent
-        return MiniLet{emeta, mutability, decl = (x, val)}
+        returnWithEnd MiniLet{emeta, mutability, decl = (x, val)}
 
       ifExpression = do
         indent <- L.indentLevel
@@ -1183,7 +1268,7 @@ expr = notFollowedBy nl >>
       ifWithSimpleCond indent ifLine head = do
         notFollowedBy (head >> nl)
         indentBlock $ do
-          emeta <- meta <$> getPosition
+          emeta <- buildMeta
           atLevel indent head
           cond <- expression
           thenLine <- sourceLine <$> getPosition
@@ -1193,7 +1278,7 @@ expr = notFollowedBy nl >>
           inlineIfThen emeta cond <|> nonInlineIfThen indent emeta cond
 
       ifWithComplexCond indent head = do
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         head
         nl
         cond <- indented indent expression
@@ -1215,7 +1300,7 @@ expr = notFollowedBy nl >>
         if endLine == ifLine
         then reserved "end"
         else atLevel indent $ reserved "end"
-        return ifThen
+        returnWithEnd ifThen
 
       ifThenElse indent ifLine ifThen = do
         elseLine <- sourceLine <$> getPosition
@@ -1224,7 +1309,8 @@ expr = notFollowedBy nl >>
           reserved "else"
           els <- expression
           reserved "end"
-          return $ extendIfThen ifThen els
+          returnWithEnd $
+            extendIfThen ifThen els
         else finalElse indent ifThen <|>
              elseIf indent ifThen
 
@@ -1247,39 +1333,39 @@ expr = notFollowedBy nl >>
             atLevel indent $ reserved "else"
             parseBody (extendIfThen ifThen)
         atLevel indent $ reserved "end"
-        return result
+        returnWithEnd result
 
       extendIfThen IfThen{emeta, cond, thn} els =
         IfThenElse{emeta, cond, thn, els}
 
       unlessIf = blockedConstruct $ do
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         reserved "unless"
         cond <- expression
         reserved "then"
         return $ \thn -> Unless{emeta, cond, thn}
 
       for = blockedConstruct $ do
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         reserved "for"
         name <- Name <$> identifier
         reservedOp "<-"
         src <- expression
-        stepMeta <- meta <$> getPosition
+        stepMeta <- buildMeta
         step <- option (IntLiteral stepMeta 1)
                        (do {reserved "by"; expression})
         reserved "do"
         return $ \body -> For{emeta, name, src, step, body}
 
       while = blockedConstruct $ do
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         reserved "while"
         cond <- expression
         reserved "do"
         return $ \body -> While{emeta, cond, body}
 
       repeat = blockedConstruct $ do
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         reserved "repeat"
         name <- Name <$> identifier
         reservedOp "<-"
@@ -1290,52 +1376,61 @@ expr = notFollowedBy nl >>
       match = do
         indent <- L.indentLevel
         theMatch <- indentBlock $ do
-          emeta <- meta <$> getPosition
+          emeta <- buildMeta
           reserved "match"
           arg <- expression
           reserved "with"
           return $ L.IndentSome Nothing (return . Match emeta arg) matchClause
         atLevel indent $ reserved "end"
-        return theMatch
+        returnWithEnd theMatch
+
+      borrow = blockedConstruct $ do
+        emeta <- buildMeta
+        reserved "borrow"
+        target <- expression
+        reserved "as"
+        name <- Name <$> identifier
+        reserved "in"
+        return $ \body -> Borrow{emeta, target, name, body}
 
       yield = do
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         reserved "yield"
         val <- expression
-        return Yield{emeta, val}
+        returnWithEnd Yield{emeta, val}
 
       isEos = do
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         reserved "eos"
         target <- expression
-        return IsEos{emeta, target}
+        returnWithEnd IsEos{emeta, target}
 
       eos = do
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         reserved "eos"
-        return Eos{emeta}
+        returnWithEnd Eos{emeta}
 
       break = do
-        pos <- getPosition
+        emeta <- buildMeta
         reserved "break"
-        return $ Break (meta pos)
+        returnWithEnd Break {emeta}
 
       continue = do
-        pos <- getPosition
+        emeta <- buildMeta
         reserved "continue"
-        return $ Continue (meta pos)
+        returnWithEnd Continue{emeta}
 
       forward = do
-        pos <- getPosition
+        emeta <- buildMeta
         reserved "forward"
-        expr <- parens expression
-        return $ Forward (meta pos) expr
+        forwardExpr <- parens expression
+        returnWithEnd Forward{emeta, forwardExpr}
 
       closure = do
         indent <- L.indentLevel
         funLine <- sourceLine <$> getPosition
         (withEnd, clos) <- indentBlock $ do
-          emeta <- meta <$> getPosition
+          emeta <- buildMeta
           reserved "fun"
           eparams <- parens (commaSep paramDecl)
           mty <- optional (colon >> typ)
@@ -1343,7 +1438,7 @@ expr = notFollowedBy nl >>
             blockClosure emeta eparams mty
         when withEnd $
              atLevel indent $ reserved "end"
-        return clos
+        returnWithEnd clos
       singleLineClosure emeta eparams mty = do
         reservedOp "=>"
         body <- expression
@@ -1358,99 +1453,107 @@ expr = notFollowedBy nl >>
                              })
 
       blockedTask = blockedConstruct $ do
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         reserved "async"
         return $ \body -> Async{emeta, body}
 
       arraySize = do
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         bar
         target <- expression
         bar
-        return ArraySize{emeta, target}
+        returnWithEnd ArraySize{emeta, target}
 
       nullLiteral = do
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         reserved "null"
-        return Null{emeta}
+        returnWithEnd Null{emeta}
 
       true = do
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         reserved "true"
-        return BTrue{emeta}
+        returnWithEnd BTrue{emeta}
 
       false = do
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         reserved "false"
-        return BFalse{emeta}
+        returnWithEnd BFalse{emeta}
 
       new = do
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         reserved "new"
+        notFollowedBy mode
         ty <- typ
         newWithoutInit emeta ty <|> newWithInit emeta ty
         where
           newWithoutInit emeta ty = do
             notFollowedBy (symbol "(")
-            return New{emeta, ty}
+            returnWithEnd New{emeta, ty}
           newWithInit emeta ty = do
             args <- parens arguments
-            return NewWithInit{emeta, ty, args}
+            returnWithEnd NewWithInit{emeta, ty, args}
 
       stringLit = do
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         stringLit <- stringLiteral
-        return StringLiteral{emeta, stringLit}
+        returnWithEnd StringLiteral{emeta, stringLit}
 
       charLit = do
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         charLit <- charLiteral
-        return CharLiteral{emeta, charLit}
+        returnWithEnd CharLiteral{emeta, charLit}
 
       int = do
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         n <- L.integer
         kind <- do hidden (symbol "u") <|> hidden (symbol "U")
                    return UIntLiteral
                <|> (hspace >> return IntLiteral)
-        return $ kind emeta (fromInteger n)
+        returnWithEnd $
+          kind emeta (fromInteger n)
 
       real = do
-        emeta <- meta <$> getPosition
+        emeta <- buildMeta
         realLit <- float
-        return RealLiteral{emeta, realLit}
+        returnWithEnd RealLiteral{emeta, realLit}
 
-      explicitReturn = do pos <- getPosition
-                          reserved "return"
-                          expr <- option (Skip (meta pos)) (do {expression})
-                          return $ Return (meta pos) expr
+      explicitReturn = do
+        emeta <- buildMeta
+        reserved "return"
+        pos <- getPosition
+        val <- option (Skip (meta $ newPos pos)) expression
+        returnWithEnd Return{emeta, val}
 
-      bracketed =
-          lineFold $ \sc' ->
+      bracketed = do
+          result <- lineFold $ \sc' ->
             folded brackets sc' (rangeOrArray <|> empty)
+          returnWithEnd result
           where
             empty = do
-              emeta <- meta <$> getPosition
+              emeta <- buildMeta
               lookAhead (symbol "]")
               return ArrayLiteral{emeta, args = []}
             rangeOrArray = do
-              emeta <- meta <$> getPosition
+              emeta <- buildMeta
               first <- expression
               range emeta first
                <|> arrayLit emeta first
             range emeta start = do
               dotdot
               stop <- expression
-              stepMeta <- meta <$> getPosition
+              stepMeta <- buildMeta
               step <- option (IntLiteral stepMeta 1)
                              (reserved "by" >> expression)
+              end <- getPosition
               return RangeLiteral{emeta, start, stop, step}
             arrayLit emeta first = longerArray <|> singletonArray
               where
-                singletonArray =
+                singletonArray = do
+                  end <- getPosition
                   return ArrayLiteral{emeta, args = [first]}
                 longerArray = do
                   notFollowedBy (symbol "]")
                   comma
                   rest <- commaSep1 expression
+                  end <- getPosition
                   return ArrayLiteral{emeta, args = first:rest}

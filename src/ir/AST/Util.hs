@@ -3,12 +3,14 @@
 {-|
   Utility functions for "AST.AST".
 -}
+
 module AST.Util(
     foldrExp
     , filter
     , extend
     , extendAccum
     , extendAccumProgram
+    , extendM
     , extractTypes
     , freeVariables
     , freeTypeVars
@@ -22,6 +24,7 @@ module AST.Util(
 import qualified Data.List as List
 import Control.Arrow(first)
 import Prelude hiding (foldr, filter)
+import Control.Monad
 
 import AST.AST
 import Types
@@ -69,11 +72,6 @@ getChildren MessageSend {target, args} = target : args
 getChildren ExtractorPattern {arg} = [arg]
 getChildren FunctionCall {args} = args
 getChildren FunctionAsValue {} = []
-getChildren Liftf {val} = [val]
-getChildren Liftv {val} = [val]
-getChildren PartyJoin {val} = [val]
-getChildren PartyExtract {val} = [val]
-getChildren PartyEach {val} = [val]
 getChildren PartySeq {par, seqfunc} = [par, seqfunc]
 getChildren PartyPar {parl, parr} = [parl, parr]
 getChildren PartyReduce {seqfun, pinit, par} = [pinit, par, seqfun]
@@ -98,6 +96,7 @@ getChildren Match {arg, clauses} = arg:getChildrenClauses clauses
 
     getChildrenClause MatchClause {mcpattern, mchandler, mcguard} =
         [mcpattern, mchandler, mcguard]
+getChildren Borrow {target, body} = [target, body]
 getChildren Get {val} = [val]
 getChildren Forward {forwardExpr} = [forwardExpr]
 getChildren Yield {val} = [val]
@@ -116,6 +115,7 @@ getChildren ArrayLiteral {args} = args
 getChildren Assign {lhs, rhs} = [lhs, rhs]
 getChildren VarAccess {} = []
 getChildren TupleAccess {target} = [target]
+getChildren Consume {target} = [target]
 getChildren Null {} = []
 getChildren BTrue {} = []
 getChildren BFalse {} = []
@@ -151,11 +151,6 @@ putChildren (target : args) e@(MethodCall {}) = e{target = target, args = args}
 putChildren (target : args) e@(MessageSend {}) = e{target = target, args = args}
 putChildren [arg] e@(ExtractorPattern {}) = e{arg = arg}
 putChildren args e@(FunctionCall {}) = e{args = args}
-putChildren [val] e@(Liftf {}) = e{val}
-putChildren [val] e@(Liftv {}) = e{val}
-putChildren [val] e@(PartyJoin {}) = e{val}
-putChildren [val] e@(PartyExtract {}) = e{val}
-putChildren [val] e@(PartyEach {}) = e{val}
 putChildren [par, seqfunc] e@(PartySeq {}) = e{par=par, seqfunc=seqfunc}
 putChildren [l, r] e@(PartyPar {}) = e{parl=l, parr=r}
 putChildren [pinit, par, seqfun] e@(PartyReduce {}) = e{par=par, seqfun=seqfun, pinit=pinit}
@@ -182,6 +177,7 @@ putChildren (arg:clauseList) e@(Match {clauses}) =
                 putClausesChildren rest rClauses
           putClausesChildren _ _ =
               error "Util.hs: Wrong number of children of of match clause"
+putChildren [target, body] e@(Borrow {}) = e{target, body}
 putChildren [val] e@(Get {}) = e{val = val}
 putChildren [forwardExpr] e@(Forward {}) = e{forwardExpr = forwardExpr}
 putChildren [val] e@(Yield {}) = e{val = val}
@@ -200,6 +196,7 @@ putChildren args e@(ArrayLiteral {}) = e{args = args}
 putChildren [lhs, rhs] e@(Assign {}) = e{lhs = lhs, rhs = rhs}
 putChildren [] e@(VarAccess {}) = e
 putChildren [target] e@(TupleAccess {}) = e{target = target}
+putChildren [target] e@(Consume {}) = e{target = target}
 putChildren [] e@(Null {}) = e
 putChildren [] e@(BTrue {}) = e
 putChildren [] e@(BFalse {}) = e
@@ -231,11 +228,6 @@ putChildren _ e@(MethodCall {}) = error "'putChildren l MethodCall' expects l to
 putChildren _ e@(MessageSend {}) = error "'putChildren l MessageSend' expects l to have at least 1 element"
 putChildren _ e@(ExtractorPattern {}) = error "'putChildren l ExtractorPattern' expects l to have 1 element"
 putChildren _ e@(FunctionAsValue {}) = error "'putChildren l FunctionAsValue' expects l to have 0 elements"
-putChildren _ e@(Liftf {}) = error "'putChildren l Liftf' expects l to have 1 element"
-putChildren _ e@(Liftv {}) = error "'putChildren l Liftv' expects l to have 1 element"
-putChildren _ e@(PartyJoin {}) = error "'putChildren l PartyJoin' expects l to have 1 element"
-putChildren _ e@(PartyExtract {}) = error "'putChildren l PartyExtract' expects l to have 1 element"
-putChildren _ e@(PartyEach {}) = error "'putChildren l PartyEach' expects l to have 1 element"
 putChildren _ e@(PartySeq {}) = error "'putChildren l PartySeq' expects l to have 2 elements"
 putChildren _ e@(PartyPar {}) = error "'putChildren l PartyPar' expects l to have 2 elements"
 putChildren _ e@(PartyReduce {}) = error "'putChildren l PartyReduce' expects l to have 3 elements"
@@ -250,7 +242,8 @@ putChildren _ e@(While {}) = error "'putChildren l While' expects l to have 2 el
 putChildren _ e@(DoWhile {}) = error "'putChildren l While' expects l to have 2 elements"
 putChildren _ e@(Repeat {}) = error "'putChildren l Repeat' expects l to have 2 elements"
 putChildren _ e@(For {}) = error "'putChildren l For' expects l to have 3 elements"
-putChildren _ e@(Match {}) = error "'putChildren l Case' expects l to have 1 element"
+putChildren _ e@(Match {}) = error "'putChildren l Match' expects l to have at least 1 element"
+putChildren _ e@(Borrow {}) = error "'putChildren l Borrow' expects l to have 2 element"
 putChildren _ e@(Get {}) = error "'putChildren l Get' expects l to have 1 element"
 putChildren _ e@(Forward {}) = error "'putChildren l Forward' expects l to have 1 element"
 putChildren _ e@(Yield {}) = error "'putChildren l Yield' expects l to have 1 element"
@@ -268,6 +261,7 @@ putChildren _ e@(ArrayNew {}) = error "'putChildren l ArrayNew' expects l to hav
 putChildren _ e@(Assign {}) = error "'putChildren l Assign' expects l to have 2 elements"
 putChildren _ e@(VarAccess {}) = error "'putChildren l VarAccess' expects l to have 0 elements"
 putChildren _ e@(TupleAccess {}) = error "'putChildren l TupleAccess' expects l to have 1 element"
+putChildren _ e@(Consume {}) = error "'putChildren l Consume' expects l to have 1 element"
 putChildren _ e@(Null {}) = error "'putChildren l Null' expects l to have 0 elements"
 putChildren _ e@(BTrue {}) = error "'putChildren l BTrue' expects l to have 0 elements"
 putChildren _ e@(BFalse {}) = error "'putChildren l BFalse' expects l to have 0 elements"
@@ -313,8 +307,8 @@ mapProgramClass p@Program{classes} f = p{classes = map f classes}
 
 extendAccumProgram ::
     (acc -> Expr -> (acc, Expr)) -> acc -> Program -> (acc, Program)
-extendAccumProgram f acc0 p@Program{functions, traits, classes, imports} =
-  (acc3, p{functions = funs', traits = traits', classes = classes', imports = imports})
+extendAccumProgram f acc0 p@Program{functions, traits, classes} =
+  (acc3, p{functions = funs', traits = traits', classes = classes'})
     where
       (acc1, funs') = List.mapAccumL (extendAccumFunction f) acc0 functions
       extendAccumFunction f acc fun@(Function{funbody, funlocals}) =
@@ -342,6 +336,11 @@ extendAccumProgram f acc0 p@Program{functions, traits, classes, imports} =
           (acc1, mbody') = extendAccum f acc mbody
           (acc2, mlocals') = List.mapAccumL (extendAccumFunction f)
                                             acc1 mlocals
+
+extendM :: Monad m => (Expr -> m Expr) -> Expr -> m Expr
+extendM f e =
+    do childResults <- mapM (extendM f) (getChildren e)
+       f (putChildren childResults e)
 
 -- | @filter cond e@ returns a list of all sub expressions @e'@ of
 -- @e@ for which @cond e'@ returns @True@
@@ -434,9 +433,10 @@ freeVariables bound expr = List.nub $ freeVariables' bound expr
     freeVariables' bound Let {decls, body} =
         freeVars ++ freeVariables' bound' body
         where
-          (freeVars, bound') = List.foldr (fvDecls . first qLocal) ([], bound) decls
-          fvDecls (x, expr) (free, bound) =
-            (freeVariables' (bound) expr ++ free, x:bound)
+          (freeVars, bound') = List.foldr fvDecls ([], bound) decls
+          fvDecls (vars, expr) (free, bound) =
+            let xs = map (qLocal . varName) vars
+            in (freeVariables' bound expr ++ free, xs ++ bound)
     freeVariables' bound e@For{name, step, src, body} =
       freeVariables' (qLocal name:bound) =<< getChildren e
     freeVariables' bound e = concatMap (freeVariables' bound) (getChildren e)

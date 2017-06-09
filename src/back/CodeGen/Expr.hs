@@ -106,20 +106,31 @@ getRuntimeType :: A.Expr -> CCode Expr
 getRuntimeType = runtimeType . Ty.getResultType . A.getType
 
 newParty :: A.Expr -> CCode Name
-newParty (A.Liftv {}) = partyNewParV
-newParty (A.Liftf {}) = partyNewParF
 newParty (A.PartyPar {}) = partyNewParP
-newParty _ = error $ "ERROR in 'Expr.hs': node is different from 'Liftv', " ++
-                     "'Liftf' or 'PartyPar'"
+newParty _ = error "Expr.hs: node is not 'PartyPar'"
 
-translateDecl (name, expr) = do
+translateDecl (vars, expr) = do
   (ne, te) <- translate expr
-  tmp <- Ctx.genNamedSym (show name)
-  substituteVar name (Var tmp)
-  return (Var tmp,
-          [Comm $ show name ++ " = " ++ show (PP.ppSugared expr)
+  let exprType = A.getType expr
+  tmp <- Var <$> Ctx.genSym
+  theAssigns <- mapM (assignDecl ne exprType) vars
+  return (tmp,
+          [Comm $ intercalate ", " (map (show . A.varName) vars) ++
+                  " = " ++ show (PP.ppSugared expr)
           ,te
-          ,Assign (Decl (translate (A.getType expr), Var tmp)) ne])
+          ] ++ theAssigns)
+  where
+    assignDecl rhs rhsType var = do
+      let x = A.varName var
+      tmp <- Var <$> Ctx.genNamedSym (show x)
+      substituteVar x tmp
+      let (lhsType, theRhs) =
+            case var of
+              A.VarType{A.varType} ->
+                (translate varType, Cast (translate varType) rhs)
+              A.VarNoType{} ->
+                (translate rhsType, AsExpr rhs)
+      return $ Assign (Decl (lhsType, tmp)) theRhs
 
 instance Translatable A.Expr (State Ctx.Context (CCode Lval, CCode Stat)) where
   -- | Translate an expression into the corresponding C code
@@ -171,39 +182,6 @@ instance Translatable A.Expr (State Ctx.Context (CCode Lval, CCode Stat)) where
           StatAsExpr (if Ty.isTypeVar ty
                       then fromEncoreArgT (Ptr void) (AsExpr n)
                       else n) t
-
-  translate l@(A.Liftf {A.val}) = do
-    (nval, tval) <- translate val
-    let runtimeT = (runtimeType . A.getType) val
-    (nliftf, tliftf) <- namedTmpVar "par" (A.getType l) $
-                        Call (newParty l) [AsExpr encoreCtxVar, AsExpr nval, runtimeT]
-    return (nliftf, Seq [tval, tliftf])
-
-  translate l@(A.Liftv {A.val}) = do
-    (nval, tval) <- translate val
-    let runtimeT = (runtimeType . A.getType) val
-    (nliftv, tliftv) <- namedTmpVar "par" (A.getType l) $
-                        Call (newParty l) [AsExpr encoreCtxVar,
-                                           asEncoreArgT (translate $ A.getType val) (AsExpr nval), runtimeT]
-    return (nliftv, Seq [tval, tliftv])
-
-  translate p@(A.PartyJoin {A.val}) = do
-    (nexpr, texpr) <- translate val
-    let typ = A.getType p
-    (nJoin, tJoin) <- namedTmpVar "par" typ $ Call partyJoin [encoreCtxVar, nexpr]
-    return (nJoin, Seq [texpr, tJoin])
-
-  translate p@(A.PartyExtract {A.val}) = do
-    (nval, tval) <- translate val
-    let runtimeT = (runtimeType . Ty.getResultType . A.getType) p
-    (nExtract, tExtract) <- namedTmpVar "arr" (A.getType p) $
-                            Call partyExtract [AsExpr encoreCtxVar, AsExpr nval, runtimeT]
-    return (nExtract, Seq [tval, tExtract])
-
-  translate p@(A.PartyEach {A.val}) = do
-    (nval, tval) <- translate val
-    (nEach, tEach) <- namedTmpVar "par" (A.getType p) $ Call partyEach [encoreCtxVar, nval]
-    return (nEach, Seq [tval, tEach])
 
   translate p@(A.PartyPar {A.parl, A.parr}) = do
     (nleft, tleft) <- translate parl
@@ -461,6 +439,42 @@ instance Translatable A.Expr (State Ctx.Context (CCode Lval, CCode Stat)) where
               (Call closureMkFn [encoreCtxVar, AsLval funName,
                                  nullVar, nullVar, rtArray])])
 
+  translate (A.Consume {A.target = arrAcc@A.ArrayAccess{A.target, A.index}}) = do
+    (ntarg, ttarg) <- translate target
+    (nindex, tindex) <- translate index
+    accessName <- Ctx.genNamedSym "access"
+    let ty = translate $ A.getType arrAcc
+        theAccess =
+            Assign (Decl (ty, Var accessName))
+                   (Call (Nam "array_get") [ntarg, nindex]
+                    `Dot` encoreArgTTag ty)
+        theSet =
+            Statement $
+            Call (Nam "array_set")
+                 [AsExpr ntarg, AsExpr nindex, asEncoreArgT ty Null]
+    return (Var accessName, Seq [ttarg, tindex, theAccess, theSet])
+
+  translate (A.Consume {A.target}) = do
+    (ntarg, ttarg) <- translate target
+    lval <- mkLval target
+    accessName <- Ctx.genNamedSym "consume"
+    let ty = translate $ A.getType target
+        theRead = Assign (Decl (ty, Var accessName)) ntarg
+        theConsume = if Ty.isMaybeType $ A.getType target
+                     then Assign lval $ Amp (Nam "DEFAULT_NOTHING")
+                     else Assign lval Null
+    return (Var accessName, Seq [ttarg, theRead, theConsume])
+         where
+           mkLval (A.VarAccess {A.qname}) =
+               do ctx <- get
+                  case Ctx.substLkp ctx qname of
+                    Just substName -> return substName
+                    Nothing -> error $ "Expr.hs: Unbound variable: " ++ show qname
+           mkLval (A.FieldAccess {A.target, A.name}) =
+               do (ntarg, ttarg) <- translate target
+                  return (Deref (StatAsExpr ntarg ttarg) `Dot` fieldName name)
+           mkLval e = error $ "Cannot translate '" ++ show e ++ "' to a valid lval"
+
   translate acc@(A.FieldAccess {A.target, A.name}) = do
     (ntarg,ttarg) <- translate target
     tmp <- Ctx.genNamedSym "fieldacc"
@@ -492,12 +506,12 @@ instance Translatable A.Expr (State Ctx.Context (CCode Lval, CCode Stat)) where
     tmpsTdecls <- mapM translateDecl decls
     let (tmps, tdecls) = unzip tmpsTdecls
     (nbody, tbody) <- translate body
-    mapM_ (unsubstituteVar . fst) decls
+    mapM_ (mapM_ (unsubstituteVar . A.varName) . fst) decls
     return (nbody, Seq $ concat tdecls ++ [tbody])
 
   translate new@(A.NewWithInit {A.ty, A.args})
-    | Ty.isActiveClassType ty = delegateUse callTheMethodOneway
-    | Ty.isSharedClassType ty = delegateUse callTheMethodOneway
+    | Ty.isActiveSingleType ty = delegateUse callTheMethodOneway
+    | Ty.isSharedSingleType ty = delegateUse callTheMethodOneway
     | otherwise = delegateUse callTheMethodSync
     where
       delegateUse methodCall =
@@ -516,7 +530,7 @@ instance Translatable A.Expr (State Ctx.Context (CCode Lval, CCode Stat)) where
               Seq $
                 [constructorCall] ++
                 initArgs ++
-                [ Statement $ callTypeParamsInit $ (AsExpr nnew):typeArgs
+                [ Statement $ callTypeParamsInit $ AsExpr nnew:typeArgs
                 , Statement result]
               )
 
@@ -580,7 +594,7 @@ instance Translatable A.Expr (State Ctx.Context (CCode Lval, CCode Stat)) where
     | (Ty.isTraitType . A.getType) target ||
       (Ty.isUnionType . A.getType) target = do
         (ntarget, ttarget) <- translate target
-        (nCall, tCall) <- traitMethod ntarget (A.getType target) name
+        (nCall, tCall) <- traitMethod msgId ntarget (A.getType target) name
                               typeArguments args (translate (A.getType call))
         let recvNullCheck = targetNullCheck ntarget target name emeta "."
         return (nCall, Seq [ttarget
@@ -608,16 +622,29 @@ instance Translatable A.Expr (State Ctx.Context (CCode Lval, CCode Stat)) where
                 [Assign (Decl (translate retTy, Var result)) resultExpr]
               )
           syncAccess = A.isThisAccess target ||
-                       (Ty.isPassiveClassType . A.getType) target
-          sharedAccess = Ty.isSharedClassType $ A.getType target
+                       (Ty.isPassiveRefType . A.getType) target
+          sharedAccess = Ty.isSharedSingleType $ A.getType target
 
   translate call@A.MessageSend{A.emeta, A.target, A.name, A.args, A.typeArguments}
+    | (Ty.isTraitType . A.getType) target ||
+      (Ty.isUnionType . A.getType) target = do
+        (ntarget, ttarget) <- translate target
+        let idFun = if Util.isStatement call
+                    then oneWayMsgId
+                    else futMsgId
+        (nCall, tCall) <- traitMethod idFun ntarget (A.getType target) name
+                              typeArguments args (translate (A.getType call))
+        let recvNullCheck = targetNullCheck ntarget target name emeta "."
+        return (nCall, Seq [ttarget
+                           ,recvNullCheck
+                           ,tCall
+                           ])
     | Util.isStatement call = delegateUseM callTheMethodOneway Nothing
     | isActive && isStream = delegateUseM callTheMethodStream (Just "stream")
     | otherwise = delegateUseM callTheMethodFuture (Just "fut")
     where
       targetTy = A.getType target
-      isActive = Ty.isActiveClassType targetTy
+      isActive = Ty.isActiveSingleType targetTy
       isStream = Ty.isStreamType $ A.getType call
 
       delegateUseM msgSend sym = do
@@ -636,26 +663,17 @@ instance Translatable A.Expr (State Ctx.Context (CCode Lval, CCode Stat)) where
                          result <- Ctx.genNamedSym (fromJust sym)
                          return (Var result, Assign (Decl (translate retTy, Var result)))
 
-  translate w@(A.DoWhile {A.cond, A.body}) =
-      do (ncond,tcond) <- translate cond
-         (nbody,tbody) <- translate body
-         tmp <- Ctx.genNamedSym "while";
-         let exportBody = Seq $ tbody : [Assign (Var tmp) nbody]
-         return (Var tmp,
-                 Seq [Statement $ Decl (translate (A.getType w), Var tmp),
-                      DoWhile (StatAsExpr ncond tcond) (Statement exportBody)])
+  translate w@(A.DoWhile {A.cond, A.body}) = do
+    (ncond,tcond) <- translate cond
+    (_,tbody) <- translate body
+    return (unit, DoWhile (StatAsExpr ncond tcond) (Statement tbody))
 
-  translate w@(A.While {A.cond, A.body}) =
-      do (ncond,tcond) <- translate cond
-         (nbody,tbody) <- translate body
-         tmp <- Ctx.genNamedSym "while";
-         let exportBody = Seq $ tbody : [Assign (Var tmp) nbody]
-         return (Var tmp,
-                 Seq [Statement $ Decl (translate (A.getType w), Var tmp),
-                      While (StatAsExpr ncond tcond) (Statement exportBody)])
+  translate w@(A.While {A.cond, A.body}) = do
+    (ncond,tcond) <- translate cond
+    (_,tbody) <- translate body
+    return (unit, While (StatAsExpr ncond tcond) (Statement tbody))
 
   translate for@(A.For {A.name, A.step, A.src, A.body}) = do
-    tmpVar   <- Var <$> Ctx.genNamedSym "for";
     indexVar <- Var <$> Ctx.genNamedSym "index"
     eltVar   <- Var <$> Ctx.genNamedSym (show name)
     startVar <- Var <$> Ctx.genNamedSym "start"
@@ -709,12 +727,10 @@ instance Translatable A.Expr (State Ctx.Context (CCode Lval, CCode Stat)) where
                    then AsExpr indexVar
                    else AsExpr $ fromEncoreArgT eltType (Call arrayGet [srcN, indexVar]))
         inc = Assign indexVar (BinOp (translate ID.PLUS) indexVar stepVar)
-        theBody = Seq [eltDecl, Statement bodyT, Assign tmpVar bodyN, inc]
+        theBody = Seq [eltDecl, Statement bodyT, inc]
         theLoop = While cond theBody
-        tmpDecl  = Statement $ Decl (translate (A.getType for), tmpVar)
 
-    return (tmpVar, Seq [tmpDecl
-                        ,srcT
+    return (unit, Seq [srcT
                         ,srcStartT
                         ,srcStopT
                         ,srcStepT
@@ -747,7 +763,7 @@ instance Translatable A.Expr (State Ctx.Context (CCode Lval, CCode Stat)) where
          (narg, targ) <- translate arg
          let argty = A.getType arg
              mType = translate (A.getType m)
-         tIfChain <- ifChain clauses narg argty retTmp mType
+         tIfChain <- ifChain clauses narg argty retTmp mType (A.getPos m)
          let lRetDecl = Decl (mType, Var retTmp)
              eZeroInit = Cast mType (Int 0)
              tRetDecl = Assign lRetDecl eZeroInit
@@ -811,7 +827,7 @@ instance Translatable A.Expr (State Ctx.Context (CCode Lval, CCode Stat)) where
                 -- pattern matching a function header works only on methods with
                 -- no arguments, and there is no meaning in allowing this at
                 -- the time being
-                traitMethod narg calledType name [] noArgs (translate tmpTy)
+                traitMethod msgId narg calledType name [] noArgs (translate tmpTy)
               else do
                 tmp <- Ctx.genNamedSym "extractedOption"
                 (argDecls, theCall) <-
@@ -914,18 +930,18 @@ instance Translatable A.Expr (State Ctx.Context (CCode Lval, CCode Stat)) where
               tAssign = Assign (Var handlerReturnVar) eCast
           return tAssign
 
-        ifChain [] _ _ _ _ = do
+        ifChain [] _ _ _ _ pos = do
           let errorCode = Int 1
               exitCall = Statement $ Call (Nam "exit") [errorCode]
-              errorMsg = String "*** Runtime error: No matching clause was found ***\n"
+              errorMsg = String $ "*** Runtime error: No matching clause was found at " ++ show pos ++ " ***\n"
               errorPrint = Statement $ Call (Nam "fprintf") [AsExpr C.stderr, errorMsg]
           return $ Seq [errorPrint, exitCall]
 
-        ifChain (clause:rest) narg argty retTmp retTy = do
+        ifChain (clause:rest) narg argty retTmp retTy pos = do
           let freeVars = Util.foldrExp (\e a -> getExprVars e ++ a) [] (A.mcpattern clause)
           assocs <- mapM createAssoc freeVars
           thenExpr <- translateHandler clause retTmp assocs retTy
-          elseExpr <- ifChain rest narg argty retTmp retTy
+          elseExpr <- ifChain rest narg argty retTmp retTy pos
           eCond <- translateIfCond clause narg argty assocs
           let tIf = Statement $ If eCond thenExpr elseExpr
               tDecls = Seq $ map (fwdDecl assocs) freeVars
@@ -988,18 +1004,10 @@ instance Translatable A.Expr (State Ctx.Context (CCode Lval, CCode Stat)) where
                                                        ,A.name
                                                        ,A.typeArguments
                                                        ,A.args}} = do
-    withForwarding <- gets Ctx.withForwarding
+    isAsyncForward <- gets Ctx.isAsyncForward
     eCtx <- gets Ctx.getExecCtx
-    let dtraceExit =
-          case eCtx of
-            Ctx.FunctionContext fun ->
-              dtraceFunctionExit (A.functionName fun)
-            Ctx.MethodContext mdecl ->
-              dtraceMethodExit thisVar (A.methodName mdecl)
-            Ctx.ClosureContext clos ->
-              dtraceClosureExit
-            _ -> error "Expr.hs: No context to forward from"
-    if withForwarding
+    let dtraceExit = getDtraceExit eCtx
+    if isAsyncForward
     then do
       (ntarget, ttarget) <- translate target
       let targetType = A.getType target
@@ -1022,8 +1030,7 @@ instance Translatable A.Expr (State Ctx.Context (CCode Lval, CCode Stat)) where
                        dtraceExit,
                        Return Skip])
 
-    else if Ty.isFutureType $ A.getType expr
-    then do
+    else do
       (sendn, sendt) <- translate A.MessageSend{A.emeta
                                                ,A.target
                                                ,A.name
@@ -1032,14 +1039,39 @@ instance Translatable A.Expr (State Ctx.Context (CCode Lval, CCode Stat)) where
       let resultType = translate (Ty.getResultType $ A.getType expr)
           theGet = fromEncoreArgT resultType (Call futureGetActor [encoreCtxVar, sendn])
       return (unit, Seq [sendt, dtraceExit, Return theGet])
-    else
-      error $ "Expr.hs: Cannot translate forward of ''" ++ show expr ++ "'"
 
-  translate A.Forward{A.forwardExpr = A.FutureChain{}} =
-    error "Expr.hs: Forwarding of chaining not implemented"
-  translate A.Forward{A.forwardExpr} =
-    error $ "Expr.hs: Target of forward is not method call or future chain: '" ++
-            show forwardExpr ++ "'"
+  translate A.Forward{A.emeta, A.forwardExpr = fchain@A.FutureChain{A.future, A.chain}} = do
+    (nfuture,tfuture) <- translate future
+    (nchain, tchain)  <- translate chain
+    eCtx <- gets $ Ctx.getExecCtx
+    isAsyncForward <- gets Ctx.isAsyncForward
+    let ty = getRuntimeType chain
+        dtraceExit = getDtraceExit eCtx
+    if isAsyncForward
+    then do
+      return (unit, Seq $
+                      [tfuture,
+                       tchain,
+                       (Statement $
+                          Call futureChainActorForward
+                           [AsExpr encoreCtxVar, AsExpr nfuture, ty, AsExpr nchain, AsExpr futVar]
+                       )] ++
+                      [dtraceExit,
+                      Return Skip])
+    else do
+      tmp <- Ctx.genSym
+      result <- Ctx.genSym
+      let nfchain = Var result
+          resultType = translate (Ty.getResultType $ A.getType fchain)
+          theGet = fromEncoreArgT resultType (Call futureGetActor [encoreCtxVar, nfchain])
+      return $ (Var tmp, Seq $
+                      [tfuture,
+                       tchain,
+                       (Assign (Decl (C.future, Var result))
+                               (Call futureChainActor
+                                 [AsExpr encoreCtxVar, AsExpr nfuture, ty, AsExpr nchain]
+                               )),
+                       Assign (Decl (resultType, Var tmp)) theGet])
 
   translate yield@(A.Yield{A.val}) =
       do (nval, tval) <- translate val
@@ -1160,6 +1192,16 @@ instance Translatable A.Expr (State Ctx.Context (CCode Lval, CCode Stat)) where
 
   translate other = error $ "Expr.hs: can't translate: '" ++ show other ++ "'"
 
+getDtraceExit eCtx =
+  case eCtx of
+    Ctx.FunctionContext fun ->
+      dtraceFunctionExit (A.functionName fun)
+    Ctx.MethodContext mdecl ->
+      dtraceMethodExit thisVar (A.methodName mdecl)
+    Ctx.ClosureContext clos ->
+      dtraceClosureExit
+    _ -> error "Expr.hs: No context to forward from"
+
 closureCall :: CCode Lval -> A.Expr ->
   State Ctx.Context (CCode Lval, CCode Stat)
 closureCall clos fcall@A.FunctionCall{A.qname, A.args} = do
@@ -1196,13 +1238,17 @@ functionCall fcall@A.FunctionCall{A.typeArguments = typeArguments
   where
     typ = A.getType fcall
     buildFunctionCallExpr args cArgs = do
-      cArgs' <- wrapArgumentsWithTypeParams args cArgs
+      let functionType = A.getArrowType fcall
+          expectedTypes = Ty.getArgTypes functionType
+          actualTypes = map A.getType args
+          castedArguments = zipWith3 castArguments expectedTypes cArgs actualTypes
+
       let runtimeTypes = map runtimeType typeArguments
       (tmpType, tmpTypeDecl) <- tmpArr (Ptr ponyTypeT) runtimeTypes
       (cname, header) <- gets (Ctx.lookupFunction qname)
       let runtimeTypeVar = if null runtimeTypes then nullVar else tmpType
           prototype = Call cname
-                           (map AsExpr [encoreCtxVar, runtimeTypeVar] ++ cArgs')
+                           (map AsExpr [encoreCtxVar, runtimeTypeVar] ++ castedArguments)
       rPrototype <- unwrapReturnType prototype
       (callVar, call) <- namedTmpVar "fun_call" typ rPrototype
       return (callVar, Seq [tmpTypeDecl, call])
@@ -1215,19 +1261,6 @@ functionCall fcall@A.FunctionCall{A.typeArguments = typeArguments
       return (if Ty.isTypeVar formalReturnType then
                AsExpr (fromEncoreArgT (translate typ) functionCall)
               else functionCall)
-
-    wrapArgumentsWithTypeParams args cArgs = do
-      -- helper function. wrap parametric arguments inside an encoreArgT
-      (_, fHeader) <- gets $ Ctx.lookupFunction qname
-      let formalTypes = map A.ptype (A.hparams fHeader)
-          argsWithFormalTypes = zip formalTypes $ zip args cArgs
-
-      return $ map (\(formalType, (arg, cArg)) ->
-                      if Ty.isTypeVar formalType then
-                        asEncoreArgT (translate $ A.getType arg) cArg
-                      else
-                        AsExpr cArg
-                   ) argsWithFormalTypes
 
 indexArgument msgName i = Arrow msgName (Nam $ "f" ++ show i)
 
@@ -1326,9 +1359,9 @@ castArguments expected targ targType
   | targType /= expected = Cast (translate expected) targ
   | otherwise = AsExpr targ
 
-traitMethod this targetType name typeargs args resultType =
+traitMethod idFun this targetType name typeargs args resultType =
   let
-    id = msgId targetType name
+    id = idFun targetType name
     tyStr = Ty.getId targetType
     nameStr = show name
   in

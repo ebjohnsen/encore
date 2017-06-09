@@ -17,7 +17,7 @@ import Text.Megaparsec(SourcePos)
 
 import Identifiers
 import Types
-import AST.Meta hiding(Closure, Async)
+import AST.Meta as Meta hiding(Closure, Async)
 
 data FileDescriptor = Stdout | Stderr
   deriving (Show, Eq)
@@ -40,33 +40,64 @@ class Show a => HasMeta a where
 
     setMeta :: a -> Meta a -> a
 
-    getPos :: a -> SourcePos
-    getPos = AST.Meta.getPos . getMeta
+    getPos :: a -> Position
+    getPos = Meta.getPos . getMeta
+
+    setEndPos :: SourcePos -> a -> a
+    setEndPos end x =
+      let oldMeta = getMeta x
+          newMeta = Meta.setEndPos end oldMeta
+      in setMeta x newMeta
 
     getType :: a -> Type
-    getType = AST.Meta.getType . getMeta
+    getType = Meta.getType . getMeta
 
     setType :: Type -> a -> a
 
-    hasType :: a -> Type -> Bool
-    hasType x ty = if ty == nullType then
-                       not $ isPrimitive ty'
-                   else
-                       ty == ty'
-                   where
-                     ty' = AST.AST.getType x
+    isFree :: a -> Bool
+    isFree = Meta.isFree . getMeta
 
-    getMetaInfo :: a -> MetaInfo
-    getMetaInfo = AST.Meta.metaInfo . getMeta
+    isCaptured :: a -> Bool
+    isCaptured = Meta.isCaptured . getMeta
+
+    makeFree :: a -> a
+    makeFree x = let meta = Meta.makeFree (getMeta x)
+                 in setMeta x meta
+
+    makeCaptured :: a -> a
+    makeCaptured x = let meta = Meta.makeCaptured (getMeta x)
+                     in setMeta x meta
+
+    getArrowType :: a -> Type
+    getArrowType = Meta.getMetaArrowType . getMeta
+
+    setArrowType :: Type -> a -> a
+    setArrowType ty x = let meta = getMeta x
+                        in setMeta x $ Meta.setMetaArrowType ty meta
 
     showWithKind :: a -> String
     showWithKind = show
+
+    makePattern :: a -> a
+    makePattern x = let meta = getMeta x
+                    in setMeta x $ Meta.makePattern meta
+
+    isPattern :: a -> Bool
+    isPattern = Meta.isPattern . getMeta
 
 data EmbedTL = EmbedTL {
       etlmeta   :: Meta EmbedTL,
       etlheader :: String,
       etlbody   :: String
     } deriving (Show)
+
+instance HasMeta EmbedTL where
+    getMeta = etlmeta
+
+    setMeta etl etlmeta = etl{etlmeta}
+
+    setType ty i =
+        error "AST.hs: Cannot set the type of a EmbedTL"
 
 data ModuleDecl = Module {
       modmeta :: Meta ModuleDecl,
@@ -183,8 +214,9 @@ instance Eq Function where
 instance HasMeta Function where
   getMeta = funmeta
   setMeta f m = f{funmeta = m}
-  setType ty f@(Function {funmeta}) =
-      f{funmeta = AST.Meta.setType ty funmeta}
+  setType ty f@(Function {funmeta, funheader}) =
+      f{funmeta = Meta.setType ty funmeta
+       ,funheader = setHeaderType ty funheader}
   showWithKind Function{funheader} =
       "function '" ++ show (hname funheader) ++ "'"
 
@@ -200,24 +232,27 @@ instance Eq ClassDecl where
   a == b = getId (cname a) == getId (cname b)
 
 isActive :: ClassDecl -> Bool
-isActive = isActiveClassType . cname
-
-isShared :: ClassDecl -> Bool
-isShared = isSharedClassType . cname
+isActive Class{cname, ccomposition} =
+  isActiveSingleType cname ||
+  isModeless cname &&
+  all isActiveSingleType (typesFromTraitComposition ccomposition)
 
 isPassive :: ClassDecl -> Bool
-isPassive = isPassiveClassType . cname
+isPassive cls = not (isActive cls) && not (isShared cls)
+
+isShared :: ClassDecl -> Bool
+isShared = isSharedSingleType . cname
 
 isMainClass :: ClassDecl -> Bool
 isMainClass cdecl =
     let ty = cname cdecl
-    in getId ty == "Main" && isActiveClassType ty
+    in getId ty == "Main" && isActive cdecl
 
 instance HasMeta ClassDecl where
     getMeta = cmeta
     setMeta c m = c{cmeta = m}
     setType ty c@(Class {cmeta, cname}) =
-      c {cmeta = AST.Meta.setType ty cmeta, cname = ty}
+      c {cmeta = Meta.setType ty cmeta, cname = ty}
     showWithKind Class{cname} = "class '" ++ getId cname ++ "'"
 
 data Requirement =
@@ -270,7 +305,7 @@ instance HasMeta TraitDecl where
   getMeta = tmeta
   setMeta t m = t{tmeta = m}
   setType ty t@Trait{tmeta, tname} =
-    t{tmeta = AST.Meta.setType ty tmeta, tname = ty}
+    t{tmeta = Meta.setType ty tmeta, tname = ty}
   showWithKind Trait{tname} = "trait '" ++ getId tname ++ "'"
 
 -- | A @TraitComposition@ is the (possibly extended) capability of
@@ -389,7 +424,8 @@ data FieldDecl = Field {
   fmeta :: Meta FieldDecl,
   fmut  :: Mutability,
   fname :: Name,
-  ftype :: Type
+  ftype :: Type,
+  fexpr :: Maybe Expr
 }
 
 instance Show FieldDecl where
@@ -402,28 +438,33 @@ instance Eq FieldDecl where
 instance HasMeta FieldDecl where
     getMeta = fmeta
     setMeta f m = f{fmeta = m}
-    setType ty f@(Field {fmeta, ftype}) = f {fmeta = AST.Meta.setType ty fmeta, ftype = ty}
+    setType ty f@(Field {fmeta, ftype}) = f {fmeta = Meta.setType ty fmeta, ftype = ty}
     showWithKind Field{fname} = "field '" ++ show fname ++ "'"
 
 isValField :: FieldDecl -> Bool
 isValField = (== Val) . fmut
 
+isVarField :: FieldDecl -> Bool
+isVarField = (== Var) . fmut
+
 data ParamDecl = Param {
   pmeta :: Meta ParamDecl,
   pmut  :: Mutability,
   pname :: Name,
-  ptype :: Type
+  ptype :: Type,
+  pdefault :: Maybe Expr
 } deriving (Show, Eq)
 
 instance HasMeta ParamDecl where
     getMeta = pmeta
     setMeta p m = p{pmeta = m}
-    setType ty p@(Param {pmeta, ptype}) = p {pmeta = AST.Meta.setType ty pmeta, ptype = ty}
+    setType ty p@(Param {pmeta, ptype}) = p {pmeta = Meta.setType ty pmeta, ptype = ty}
     showWithKind Param{pname} = "parameter '" ++ show pname ++ "'"
 
 data MethodDecl =
     Method {
       mmeta   :: Meta MethodDecl,
+      mimplicit :: Bool,
       mheader :: FunctionHeader,
       mlocals :: [Function],
       mbody   :: Expr
@@ -442,10 +483,16 @@ isMainMethod ty name = isMainType ty && (name == Name "main")
 isConstructor :: MethodDecl -> Bool
 isConstructor m = methodName m == constructorName
 
+isImplicitMethod = mimplicit
+
+hasConstructor :: ClassDecl -> Bool
+hasConstructor Class{cmethods} = filter isConstructor cmethods /= []
+
 emptyConstructor :: ClassDecl -> MethodDecl
 emptyConstructor cdecl =
     let pos = AST.AST.getPos cdecl
     in Method{mmeta = meta pos
+             ,mimplicit = True
              ,mheader = Header{hmodifiers = []
                               ,kind = NonStreaming
                               ,htypeparams = []
@@ -487,7 +534,7 @@ instance HasMeta MethodDecl where
       let header = mheader m
           meta = mmeta m
       in
-        m{mmeta = AST.Meta.setType ty meta
+        m{mmeta = Meta.setType ty meta
          ,mheader = setHeaderType ty header}
   showWithKind m
       | isStreamMethod m = "streaming method '" ++ show (methodName m) ++ "'"
@@ -505,6 +552,7 @@ type Arguments = [Expr]
 data MaybeContainer = JustData { e :: Expr}
                     | NothingData deriving(Eq, Show)
 
+
 data Mutability = Var
                 | Val deriving(Eq)
 
@@ -513,6 +561,12 @@ instance Show Mutability where
     show Val = "val"
 
 data OptionalPathComponent = QuestionDot Expr | QuestionBang Expr deriving (Show, Eq)
+
+data VarDecl =
+    VarNoType {varName :: Name}
+  | VarType {varName :: Name,
+             varType :: Type}
+  deriving(Eq, Show)
 
 data Expr = Skip {emeta :: Meta Expr}
           | Break {emeta :: Meta Expr}
@@ -547,19 +601,6 @@ data Expr = Skip {emeta :: Meta Expr}
                      eparams :: [ParamDecl],
                      mty :: Maybe Type,
                      body :: Expr}
-          -- TODO: the AST nodes below can be removed as soon as
-          -- OldParser.hs gets removed
-          | Liftf {emeta :: Meta Expr,
-                   val :: Expr}
-          | Liftv {emeta :: Meta Expr,
-                   val :: Expr}
-          | PartyJoin {emeta :: Meta Expr,
-                       val :: Expr}
-          | PartyExtract {emeta :: Meta Expr,
-                          val :: Expr}
-          | PartyEach {emeta :: Meta Expr,
-                       val :: Expr}
-          -- END TODO
           | PartySeq {emeta :: Meta Expr,
                       par :: Expr,
                       seqfunc :: Expr}
@@ -581,11 +622,11 @@ data Expr = Skip {emeta :: Meta Expr}
                    args :: [Expr]}
           | Let {emeta :: Meta Expr,
                  mutability :: Mutability,
-                 decls :: [(Name, Expr)],
+                 decls :: [([VarDecl], Expr)],
                  body :: Expr}
           | MiniLet {emeta :: Meta Expr,
                      mutability :: Mutability,
-                     decl :: (Name, Expr)}
+                     decl :: ([VarDecl], Expr)}
           | Seq {emeta :: Meta Expr,
                  eseq :: [Expr]}
           | IfThenElse {emeta :: Meta Expr,
@@ -616,6 +657,10 @@ data Expr = Skip {emeta :: Meta Expr}
           | Match {emeta :: Meta Expr,
                    arg :: Expr,
                    clauses :: [MatchClause]}
+          | Borrow {emeta  :: Meta Expr,
+                    target :: Expr,
+                    name   :: Name,
+                    body   :: Expr}
           | Get {emeta :: Meta Expr,
                  val :: Expr}
           | Forward {emeta :: Meta Expr,
@@ -631,7 +676,7 @@ data Expr = Skip {emeta :: Meta Expr}
                    val :: Expr}
           | Suspend {emeta :: Meta Expr}
           | FutureChain {emeta :: Meta Expr,
-                         future :: Expr,
+                        future :: Expr,
                          chain :: Expr}
           | FieldAccess {emeta :: Meta Expr,
                          target :: Expr,
@@ -654,6 +699,8 @@ data Expr = Skip {emeta :: Meta Expr}
           | TupleAccess {emeta :: Meta Expr,
                          target :: Expr,
                          compartment :: Int}
+          | Consume {emeta :: Meta Expr,
+                     target :: Expr}
           | Null {emeta :: Meta Expr}
           | BTrue {emeta :: Meta Expr}
           | BFalse {emeta :: Meta Expr}
@@ -726,6 +773,14 @@ isForward :: Expr -> Bool
 isForward Forward {} = True
 isForward _ = False
 
+isNull :: Expr -> Bool
+isNull Null{} = True
+isNull _ = False
+
+isTask :: Expr -> Bool
+isTask Async {} = True
+isTask _ = False
+
 isRangeLiteral :: Expr -> Bool
 isRangeLiteral RangeLiteral {} = True
 isRangeLiteral _ = False
@@ -740,6 +795,10 @@ isStringLiteral _ = False
 isReturn :: Expr -> Bool
 isReturn Return{} = True
 isReturn _ = False
+
+isArrayLiteral :: Expr -> Bool
+isArrayLiteral ArrayLiteral{} = True
+isArrayLiteral _ = False
 
 isNullLiteral :: Expr -> Bool
 isNullLiteral Null{} = True
@@ -758,15 +817,15 @@ isPrimitiveLiteral RealLiteral{}   = True
 isPrimitiveLiteral Unary{uop = NEG, operand} = isPrimitiveLiteral operand
 isPrimitiveLiteral _ = False
 
-isPattern :: Expr -> Bool
-isPattern TypedExpr{body} = isPattern body
-isPattern FunctionCall{} = True
-isPattern MaybeValue{mdt = JustData{e}} = isPattern e
-isPattern MaybeValue{mdt = NothingData} = True
-isPattern Tuple{args} = all isPattern args
-isPattern VarAccess{} = True
-isPattern Null{} = True
-isPattern e
+isValidPattern :: Expr -> Bool
+isValidPattern TypedExpr{body} = isValidPattern body
+isValidPattern FunctionCall{} = True
+isValidPattern MaybeValue{mdt = JustData{e}} = isValidPattern e
+isValidPattern MaybeValue{mdt = NothingData} = True
+isValidPattern Tuple{args} = all isValidPattern args
+isValidPattern VarAccess{} = True
+isValidPattern Null{} = True
+isValidPattern e
     | isPrimitiveLiteral e = True
     | otherwise = False
 
@@ -784,25 +843,38 @@ isImpure NewWithInit {} = True
 isImpure New {} = True
 isImpure _ = False
 
+hasBody :: Expr -> Bool
+hasBody Closure {} = True
+hasBody Async {} = True
+hasBody Let {} = True
+hasBody IfThenElse {} = True
+hasBody IfThen {} = True
+hasBody Unless {} = True
+hasBody While {} = True
+hasBody DoWhile {} = True
+hasBody Repeat {} = True
+hasBody For {} = True
+hasBody Match {} = True
+hasBody _ = False
+
+findRoot :: Expr -> Expr
+findRoot FieldAccess{target} = findRoot target
+findRoot MethodCall{target} = findRoot target
+findRoot MessageSend{target} = findRoot target
+findRoot TupleAccess{target} = findRoot target
+findRoot e = e
+
 instance HasMeta Expr where
     getMeta = emeta
     setMeta e m = e{emeta = m}
 
-    hasType (Null {}) ty = not . isPrimitive $ ty
-    hasType x ty = if ty == nullType then
-                       not $ isPrimitive ty'
-                   else
-                       ty == ty'
-                   where
-                     ty' = AST.AST.getType x
-
-    setType ty expr = expr {emeta = AST.Meta.setType ty (emeta expr)}
+    setType ty expr = expr {emeta = Meta.setType ty (emeta expr)}
 
 setSugared :: Expr -> Expr -> Expr
-setSugared e sugared = e {emeta = AST.Meta.setSugared sugared (emeta e)}
+setSugared e sugared = e {emeta = Meta.setSugared sugared (emeta e)}
 
 getSugared :: Expr -> Maybe Expr
-getSugared e = AST.Meta.getSugared (emeta e)
+getSugared e = Meta.getSugared (emeta e)
 
 getTrait :: Type -> Program -> TraitDecl
 getTrait t p =

@@ -26,7 +26,8 @@ import AST.AST hiding (hasType, getType)
 import qualified AST.AST as AST (getType)
 import qualified AST.Util as Util (freeVariables, filter, markStatsInBody, isStatement)
 import AST.PrettyPrinter
-import Types
+import AST.Util(extend)
+import Types as Ty
 import Typechecker.Environment
 import Typechecker.TypeError
 import Typechecker.Util
@@ -140,22 +141,64 @@ instance Checkable Function where
               ,funlocals = eLocals}
 
 instance Checkable TraitDecl where
-  doTypecheck t@Trait{tname, tmethods} = do
-    emethods <- mapM typecheckMethod tmethods
-    return t{tmethods = emethods}
+  doTypecheck t@Trait{tname, tmethods, treqs} = do
+    ereqs <- local (addTypeParams . addThis) $
+             mapM doTypecheck treqs
+    emethods <- local (addTypeParams . addMinorThis) $
+                mapM typecheck tmethods
+    return t{tmethods = emethods, treqs = ereqs}
     where
       addTypeParams = addTypeParameters $ getTypeParameters tname
+      addMinorThis =
+        extendEnvironmentImmutable $
+          if hasMinorMode tname
+          then [(thisName, makeSubordinate tname)]
+          else [(thisName, tname)]
       addThis = extendEnvironmentImmutable [(thisName, tname)]
-      typecheckMethod = local (addTypeParams . addThis) . typecheck
 
-matchArgumentLength :: Type -> FunctionHeader -> Arguments -> TypecheckM ()
+instance Checkable Requirement where
+  doTypecheck r@RequiredField{rfield} = do
+    rfield' <- typecheck rfield
+    return r{rfield = rfield'}
+  doTypecheck r@RequiredMethod{rheader} = return r
+
+instance Checkable FieldDecl where
+  doTypecheck f@Field{ftype} = do
+    Just (_, thisType)  <- findVar (qLocal thisName)
+    when (isReadSingleType thisType) $ do
+         unless (isValField f) $
+                tcError $ NonValInReadContextError thisType
+         isAliasable <- isAliasableType ftype
+         unless isAliasable $
+                tcError $ NonSafeInReadContextError thisType ftype
+         when (isArrayType ftype) $
+              tcWarning ArrayInReadContextWarning
+    isLocalField <- isLocalType ftype
+    isLocalThis <- isLocalType thisType
+    when isLocalField $
+      unless (isModeless thisType || isLocalThis ||
+              isActiveSingleType thisType) $
+      tcError $ ThreadLocalFieldError thisType
+    return f
+
+
+matchArgumentLength :: Type -> FunctionHeader -> Arguments -> TypecheckM Name
 matchArgumentLength targetType header args =
-  unless (actual == expected) $
-         tcError $ WrongNumberOfMethodArgumentsError
-                   (hname header) targetType expected actual
+      if (actual == expected)
+        then return name
+        else
+          do
+          result <- asks $ methodLookup targetType defName
+          case result of
+            Just header' -> return defName
+            Nothing -> tcError $ WrongNumberOfMethodArgumentsError
+              (hname header) targetType expected actual
   where
+    name = hname header
+    defName = Name ("_" ++ show(name) ++ show (expected - actual))
     actual = length args
     expected = length (hparams header)
+
 
 meetRequiredFields :: [FieldDecl] -> Type -> TypecheckM ()
 meetRequiredFields cFields trait = do
@@ -177,6 +220,9 @@ meetRequiredFields cFields trait = do
         isSub <- cFieldType `subtypeOf` expected
         unless (cFieldType == expected) $
             tcError $ RequiredFieldMismatchError cField expected trait isSub
+        when (isVarField expField) $
+             unless (isVarField cField) $
+                 tcError $ RequiredFieldMutabilityError trait cField
 
 noOverlapFields :: Type -> Maybe TraitComposition -> TypecheckM ()
 noOverlapFields cname composition =
@@ -256,11 +302,16 @@ ensureMatchingTraitFootprint cname extTraits extTrait = do
           footprint = requiredFields provider
           varFootprint = filter (not . isValField) footprint
           mutatedValFields = filter (`elem` reqValFields) varFootprint
-      unless (null providedMethods) $
+      unless (null providedMethods) $ do
         unless (null mutatedValFields) $
           tcError $ ProvidingTraitFootprintError
                       (tname provider) (tname requirer)
                       (methodName $ head providedMethods) mutatedValFields
+        when (isReadSingleType $ tname requirer) $
+          unless (isReadSingleType $ tname provider) $
+            tcError $ ProvidingToReadTraitError
+                        (tname provider) (tname requirer)
+                        (methodName $ head providedMethods)
 
     isRequiredBy :: MethodDecl -> TraitDecl -> Bool
     isRequiredBy m = any ((== methodName m) . hname) . requiredMethods
@@ -352,14 +403,28 @@ checkOverriding cname typeParameters methods extendedTraits = do
         typecheckWithTrait =
           local (addAbstractTrait . addTypeParams . addThis) $
                 typecheck method
+
+checkManifestModes :: [Type] -> TypecheckM ()
+checkManifestModes traits = do
+  formalTraits <- mapM findFormalRefType traits
+  mapM_ (checkForConflictingModes traits) formalTraits
+  where
+    checkForConflictingModes actualTraits formal =
+      unless (hasMinorMode formal) $ do
+        let conflicting = filter (not . (`isCompatibleWith` formal))
+                                 actualTraits
+        unless (null conflicting) $
+               tcError $ ManifestConflictError formal (head conflicting)
+    isCompatibleWith other ty =
+        other `modeSubtypeOf` ty ||
+        hasMinorMode other
+
 instance Checkable ClassDecl where
   -- TODO: Update this rule!
   --  E, this : cname |- method1 .. E, this : cname |- methodm
   -- -----------------------------------------------------------
   --  E |- class cname fields methods
   doTypecheck c@(Class {cname, cfields, cmethods, ccomposition}) = do
-    unless (isPassiveClassType cname || isNothing ccomposition) $
-           tcError TraitsInActiveClassError
 
     when (isPassiveClassType cname) $
          unless (null $ filter isForwardMethod cmethods) $
@@ -372,21 +437,48 @@ instance Checkable ClassDecl where
     meetRequiredMethods cmethods traits
     ensureNoMethodConflict cmethods traits
 
+    checkManifestModes traits
+
     mapM_ (ensureMatchingTraitFootprint cname extendedTraits) extendedTraits
     noOverlapFields cname ccomposition
 
     checkOverriding cname typeParameters cmethods extendedTraits
+
+    checkMethodExtensionAllowed
+
     -- TODO: Add namespace for trait methods
 
-    emethods <- mapM typecheckMethod cmethods
+    efields <- local (addTypeVars . addThis) $
+               mapM typecheck cfields
+    emethods <- local (addTypeVars . addThis) $
+                mapM typecheck cmethods
 
-    return c{cmethods = emethods}
+    return c{cmethods = emethods, cfields = efields}
     where
       typeParameters = getTypeParameters cname
       addTypeVars = addTypeParameters typeParameters
       addThis = extendEnvironmentImmutable [(thisName, cname)]
-      typecheckMethod m = local (addTypeVars . addThis) $ typecheck m
       isForwardMethod m@Method{mbody} = not . null $ Util.filter isForward mbody
+
+      checkMethodExtensionAllowed
+        | isModeless cname = do
+            let extendedTraits = extendedTraitsFromComposition ccomposition
+                extensions = concatMap snd extendedTraits
+                (_, extendedMethods) = partitionTraitExtensions extensions
+                cap = capabilityFromTraitComposition ccomposition
+            mapM_ (extensionAllowed cap extendedMethods) cmethods
+        | otherwise = return ()
+
+      extensionAllowed cap extensions method
+        | isMainMethod cname (methodName method) = return ()
+        | isConstructor method = return ()
+        | isImplicitMethod method = return ()
+        | otherwise = do
+            let name = methodName method
+            lookupResult <- asks $ methodLookup cap name
+            unless (isJust lookupResult || name `elem` extensions) $
+                tcError $ UnmodedMethodExtensionError cname name
+
 
 instance Checkable MethodDecl where
     --  E, x1 : t1, .., xn : tn |- mbody : mtype
@@ -474,7 +566,7 @@ instance Checkable Expr where
     doTypecheck continue@(Continue {emeta}) = do
       unless (Util.isStatement continue) $
         tcError ContinueUsedAsExpressionError
-      unlessM (asks $ checkValidUseOfContinue) $
+      unlessM (asks checkValidUseOfContinue) $
         tcError ContinueOutsideOfLoopError
       return $ setType unitType continue
 
@@ -484,41 +576,10 @@ instance Checkable Expr where
     --  E |- (body : t) : t
     doTypecheck te@(TypedExpr {body, ty}) =
         do ty' <- resolveType ty
-           eBody <- hasType body ty'
-           return $ setType ty' $ te{body = eBody, ty = ty'}
-
-    doTypecheck l@(Liftf {val}) = do
-      e <- typecheck val
-      let typ = AST.getType e
-      unless (isFutureType typ) $
-             pushError e $ ExpectingOtherTypeError "a future" typ
-      return $ setType (parType $ getResultType typ) l {val = e}
-
-    doTypecheck l@(Liftv {val}) = do
-      e <- typecheck val
-      let typ = AST.getType e
-      return $ setType (parType typ) l {val = e}
-
-    doTypecheck p@(PartyJoin {val}) = do
-      e <- typecheck val
-      let typ = AST.getType e
-      unless (isParType typ && isParType (getResultType typ)) $
-             pushError e $ ExpectingOtherTypeError "a nested Par" typ
-      return $ setType (getResultType typ) p {val = e}
-
-    doTypecheck p@(PartyEach {val}) = do
-      e <- typecheck val
-      let typ = AST.getType e
-      unless (isArrayType typ) $
-             pushError e $ ExpectingOtherTypeError "an array" typ
-      return $ setType ((parType.getResultType) typ) p {val = e}
-
-    doTypecheck p@(PartyExtract {val}) = do
-      e <- typecheck val
-      let typ = AST.getType e
-      unless (isParType typ) $
-             pushError e $ ExpectingOtherTypeError "a Par" typ
-      return $ setType ((arrayType.getResultType) typ) p {val = e}
+           eBody <- typecheck body
+           bodyType <- AST.getType eBody `coercedInto` ty'
+           let eBody' = setType bodyType eBody
+           return $ setType ty' $ te{body = eBody', ty = ty'}
 
     doTypecheck p@(PartyPar {parl, parr}) = do
       pl <- typecheck parl
@@ -554,6 +615,7 @@ instance Checkable Expr where
       let eSeqFunc' = setType expectedFunType eSeqFunc
           funResultType = getResultType expectedFunType
       return $ setType (parType funResultType) pSeq {par=ePar, seqfunc=eSeqFunc'}
+
 
     doTypecheck red@(PartyReduce {seqfun, pinit, par}) = do
       ePar <- typecheck par
@@ -630,7 +692,7 @@ instance Checkable Expr where
               in
                 doTypecheck Let{emeta = emeta mcall
                                ,mutability = Val
-                               ,decls = [(name, fieldAccess)]
+                               ,decls = [([VarNoType name], fieldAccess)]
                                ,body
                                }
             else
@@ -642,10 +704,16 @@ instance Checkable Expr where
 
             (header, calledType) <- findMethodWithCalledType targetType (name mcall)
 
-            matchArgumentLength targetType header (args mcall)
-            let eTarget' = setType calledType eTarget
+            calledName <- matchArgumentLength targetType header (args mcall)
+
+            isActive <- isActiveType targetType
+            let eTarget' = if isThisAccess eTarget &&
+                              isActive && isMethodCall mcall
+                           then setType (makeLocal calledType) eTarget
+                           else setType calledType eTarget
+
                 typeParams = htypeparams header
-                argTypes = map ptype $ hparams header
+                argTypes = map ptype $ take (length (args mcall)) (hparams header)
                 resultType = htype header
 
             (eArgs, resultType', typeArgs) <-
@@ -653,19 +721,23 @@ instance Checkable Expr where
                   inferenceCall mcall typeParams argTypes resultType
                else
                   typecheckCall mcall typeParams argTypes resultType
-            let returnType = retType mcall calledType header resultType'
-                isThisCall = isThisAccess (target mcall)
+
+            checkEncapsulation eTarget' (name mcall) resultType eArgs
+
+            returnType <- retType mcall calledType header resultType'
+            let isThisCall = isThisAccess (target mcall)
                 isStream = isStreamMethodHeader header
                 isAsync = isMessageSend mcall
-
-            let returnType' = if isAsync && isThisCall
+                returnType' = if isAsync && isThisCall
                               then futureType returnType
                               else returnType
 
             when (isStream && isThisCall) $ tcError SyncStreamCall
-            return $ setType returnType' mcall {target = eTarget'
+            return $ setArrowType (arrowType argTypes resultType) $
+                     setType returnType' mcall {target = eTarget'
                                               ,args = eArgs
-                                              ,typeArguments = typeArgs}
+                                              ,typeArguments = typeArgs
+                                              ,name = calledName }
 
           errorInitMethod targetType name = do
             when (name == constructorName) $ tcError ConstructorCallError
@@ -674,20 +746,22 @@ instance Checkable Expr where
           handleErrors targetType m
             | isMessageSend m = do
               errorInitMethod targetType (name m)
-              unless (isActiveClassType targetType ||
-                      isSharedClassType targetType) $
+              isActive <- isActiveType targetType
+              isShared <- isSharedType targetType
+              unless (isActive || isShared) $
                 tcError $ NonSendableTargetError targetType
             | isMethodCall m = do
-              when (isRefType targetType) $
-                unless (isPassiveType targetType || isThisAccess (target mcall)) $
-                  tcError BadSyncCallError
+              when (isRefType targetType) $ do
+                isPassive <- isPassiveType targetType
+                unless (isPassive || isThisAccess (target mcall)) $
+                       tcError BadSyncCallError
               let name' = name m
               unless (isRefType targetType) $
                      tcError $ NonCallableTargetError targetType
               errorInitMethod targetType name'
             | otherwise =
                 error $ "Typechecker.hs: expression '" ++ show m ++ "' " ++
-                    "is not a method or function call"
+                        "is not a method or function call"
 
     doTypecheck maybeData@(MaybeValue {mdt}) = do
       when (Util.isStatement maybeData) $
@@ -737,23 +811,34 @@ instance Checkable Expr where
         let typeParams  = getTypeParameters ty
             argTypes    = getArgTypes ty
             resultType  = getResultType ty
+            actualLength = length args
+            expectedLength = length argTypes
+            defName = qname'{qnlocal = Name $ "_" ++ show qname ++ show (expectedLength - actualLength)}
+
+        calledName <-
+          if (actualLength == expectedLength)
+            then return qname'
+            else do
+              result2 <- findVar defName
+              case result2 of
+                Just (qname2, ty2) -> return defName
+                Nothing -> tcError $ WrongNumberOfFunctionArgumentsError
+                            qname (length argTypes) (length args)
 
         unless (isArrowType ty) $
           tcError $ NonFunctionTypeError ty
-        unless (length args == length argTypes) $
-          tcError $ WrongNumberOfFunctionArgumentsError
-                      qname (length argTypes) (length args)
 
         (eArgs, returnType, typeArgs) <-
           if null typeArguments
-          then inferenceCall fcall typeParams argTypes resultType
+          then inferenceCall fcall typeParams (take actualLength argTypes) resultType
           else do
             unless (length typeArguments == length typeParams) $
                    tcError $ WrongNumberOfFunctionTypeArgumentsError qname
                              (length typeParams) (length typeArguments)
-            typecheckCall fcall typeParams argTypes resultType
-        return $ setType returnType fcall {args = eArgs,
-                                           qname = qname',
+            typecheckCall fcall typeParams (take actualLength argTypes) resultType
+        return $ setArrowType ty $
+                 setType returnType fcall {args = eArgs,
+                                           qname = calledName,
                                            typeArguments = typeArgs}
 
    ---  |- t1 .. |- tn
@@ -762,7 +847,6 @@ instance Checkable Expr where
     -- ------------------------------------------------------
     --  E |- \ (x1 : t1, .., xn : tn) -> body : (t1 .. tn) -> t
     doTypecheck closure@(Closure {eparams, mty, body}) = do
-      let returns = Util.filter isReturn body
       eEparams <- mapM typecheck eparams
       mty' <- mapM resolveType mty
       eBody <- case mty' of
@@ -777,8 +861,9 @@ instance Checkable Expr where
                    local (addParams eEparams) $
                          typecheckNotNull body
       let paramNames = map pname eEparams
-          capturedVariables = map (qnlocal . fst) $
-                              Util.freeVariables (map qLocal paramNames) eBody
+          captured = Util.freeVariables (map qLocal paramNames) eBody
+          capturedVariables = map (qnlocal . fst) captured
+          capturedTypes = map snd captured
 
       shadowingParams <- filterM doesShadow paramNames
       unless (null shadowingParams) $
@@ -788,39 +873,77 @@ instance Checkable Expr where
             typecheck eBody -- Check for mutation of captured variables
       let returnType = AST.getType eBody
           ty = arrowType (map ptype eEparams) returnType
-      return $ setType ty closure {body = eBody, mty = mty', eparams = eEparams}
+      modedType <- giveModes capturedTypes ty
+      return $ setType modedType closure {body = eBody
+                                         ,mty = mty'
+                                         ,eparams = eEparams}
       where
         doesShadow paramName = do
           typeParams <- asks typeParameters
           return $ paramName `elem` map (Name . getId) typeParams
+        giveModes types arrow = foldM giveMode arrow types
+        giveMode arrow ty = do
+          isLocal <- isLocalType ty
+          isSubord <- isSubordinateType ty
+          let modes = [isLocal `thenDo` makeLocal
+                      ,isSubord `thenDo` makeSubordinate
+                      ,isStackboundType ty `thenDo` makeStackbound
+                      ]
+          return $ foldr ($) arrow modes
+        thenDo True f = f
+        thenDo False _ = id
 
     --  E |- e1 : t1; E, x1 : t1 |- e2 : t2; ..; E, x1 : t1, .., x(n-1) : t(n-1) |- en : tn
     --  E, x1 : t1, .., xn : tn |- body : t
     --  x1 != nullType .. xn != nullType
     -- --------------------------------------------------------------------------------------
     --  E |- let x1 = e1 .. xn = en in body : t
+
     doTypecheck let_@(Let {mutability, decls, body}) =
         do eDecls <- typecheckDecls decls
-           let declNames = map fst eDecls
-               declTypes = map (AST.getType . snd) eDecls
-               addNames = (if mutability == Val
-                           then extendEnvironmentImmutable
-                           else extendEnvironment) $ zip declNames declTypes
+           let extract (vars, e) = let ty = AST.getType e
+                                   in map (extractBindings ty) vars
+               locals = concatMap extract eDecls
+               declTypes = map snd locals
            when (any isBottomType (concatMap typeComponents declTypes)) $
                 tcError BottomTypeInferenceError
+           let addNames = (if mutability == Val
+                           then extendEnvironmentImmutable
+                           else extendEnvironment) locals
            eBody <- local addNames $ typecheck body
            return $ setType (AST.getType eBody) let_ {decls = eDecls
                                                      ,body = eBody}
         where
+          extractBindings :: Type -> VarDecl -> (Name, Type)
+          extractBindings ty VarType{varName, varType} = (varName, varType)
+          extractBindings ty VarNoType{varName} = (varName, ty)
+
+          typecheckDecls :: [([VarDecl], Expr)] ->
+                            TypecheckM [([VarDecl], Expr)]
           typecheckDecls [] = return []
-          typecheckDecls ((name, expr):decls') =
-              do eExpr <- typecheckNotNull expr
-                 let addName =
-                         (if mutability == Val
-                          then extendEnvironmentImmutable
-                          else extendEnvironment) [(name, AST.getType eExpr)]
-                 eDecls <- local addName $ typecheckDecls decls'
-                 return $ (name, eExpr):eDecls
+          typecheckDecls ((vars, expr):decls') = do
+            eExpr <- typecheckNotNull expr
+            let eType = AST.getType eExpr
+            eVars <- mapM (checkBinding eType) vars
+            let localBindings = map (extractBindings eType) eVars
+                varTypes = map snd localBindings
+            hasLinear <- anyM isLinearType varTypes
+            when (length varTypes > 1 && hasLinear) $ do
+                 checkConjunction eType varTypes
+                 tcWarning CapabilitySplitWarning
+            let addNames = (if mutability == Val
+                            then extendEnvironmentImmutable
+                            else extendEnvironment) localBindings
+            eDecls <- local addNames $
+                            typecheckDecls decls'
+            return $ (eVars, eExpr):eDecls
+
+          checkBinding eType (VarType x ty) = do
+            ty' <- resolveType ty
+            eType `assertSubtypeOf` ty'
+            return (VarType x ty')
+          checkBinding eType (VarNoType x) =
+              return (VarNoType x)
 
     --  E |- en : t
     -- ------------------------
@@ -894,7 +1017,7 @@ instance Checkable Expr where
           tcError EmptyMatchClauseError
         eArg <- typecheck arg
         let argType = AST.getType eArg
-        when (isActiveClassType argType) $
+        when (isActiveSingleType argType) $
           unless (isThisAccess arg) $
             tcError ActiveMatchError
         eClauses <- mapM (checkClause argType) clauses
@@ -1022,7 +1145,9 @@ instance Checkable Expr where
               extractedType = getResultType hType
           eArg <- checkPattern arg extractedType
           matchArgumentLength argty header []
-          return $ setType argty ExtractorPattern {emeta
+          checkReturnEncapsulation (qnlocal qname) extractedType argty
+          return $ setArrowType (arrowType [] hType) $
+                   setType argty ExtractorPattern {emeta
                                                   ,ty = argty
                                                   ,name
                                                   ,arg = eArg
@@ -1054,7 +1179,7 @@ instance Checkable Expr where
           return $ setType ty' eBody
 
         doCheckPattern pattern argty
-            | isPattern pattern = hasType pattern argty
+            | isValidPattern pattern = hasType pattern argty
             | otherwise = tcError $ InvalidPatternError pattern
 
         checkClause pt clause@MatchClause{mcpattern, mchandler, mcguard} = do
@@ -1063,9 +1188,37 @@ instance Checkable Expr where
           ePattern <- withLocalEnv $ checkPattern mcpattern pt
           eHandler <- withLocalEnv $ typecheck mchandler
           eGuard <- withLocalEnv $ hasType mcguard boolType
-          return $ clause {mcpattern = ePattern
+          return $ clause {mcpattern = extend makePattern ePattern
                           ,mchandler = eHandler
                           ,mcguard = eGuard}
+
+    doTypecheck borrow@(Borrow{target, name, body}) = do
+      eTarget <- typecheck target
+      let targetType   = AST.getType eTarget
+          borrowedType = makeStackbound targetType
+          eTarget'     = setType borrowedType eTarget
+      targetIsLinear <- isLinearType targetType
+      let root         = findRoot target
+          borrowEnv    =
+            (case root of
+               VarAccess{qname} ->
+                 if targetIsLinear
+                 then dropLocal (qnlocal qname)
+                 else id
+               _ -> id) . extendEnvironmentImmutable [(name, borrowedType)]
+      eBody <- local borrowEnv $ typecheck body
+               `catchError` handleBurying root
+      let bodyTy = AST.getType eBody
+      return $ setType bodyTy borrow{target = eTarget', body = eBody}
+      where
+        handleBurying :: Expr -> TCError -> TypecheckM Expr
+        handleBurying VarAccess{qname}
+                      (TCError err@(UnboundVariableError unbound) bt) =
+          if unbound == qname
+          then throwError $ TCError (BuriedVariableError qname) bt
+          else throwError $ TCError err bt
+        handleBurying _ (TCError err bt) =
+          throwError $ TCError err bt
 
     --  E |- cond : bool
     --  E |- body : t
@@ -1102,8 +1255,6 @@ instance Checkable Expr where
     doTypecheck forward@(Forward {forwardExpr}) =
         do eExpr <- typecheck forwardExpr
            let ty = AST.getType eExpr
-           unless (isMessageSend forwardExpr) $
-                  pushError eExpr $ ForwardArgumentError
            unless (isFutureType ty) $
                   pushError eExpr $ ExpectingOtherTypeError
                                       "a future" ty
@@ -1234,7 +1385,7 @@ instance Checkable Expr where
       let compartments = getArgTypes targetType
       unless (0 <= compartment && compartment < tupleLength targetType) $
         tcError $ InvalidTupleAccessError eTarget compartment
-      return $ setType (compartments!!(compartment)) ta {target = eTarget}
+      return $ setType (compartments !! compartment) ta {target = eTarget}
 
     --  E |- target : t'
     --  fieldLookup(t', name) = t
@@ -1243,10 +1394,18 @@ instance Checkable Expr where
     doTypecheck fAcc@(FieldAccess {target, name}) = do
       eTarget <- typecheck target
       let targetType = AST.getType eTarget
-      unless (isThisAccess target || isPassiveClassType targetType) $
+      isActive <- isActiveType targetType
+      let accessedType = if isThisAccess eTarget && isActive
+                         then makeLocal targetType
+                         else targetType
+          eTarget' = setType accessedType eTarget
+      unless (isThisAccess target ||
+              isPassiveClassType targetType && not (isModeless targetType)) $
         tcError $ CannotReadFieldError eTarget
-      ty <- ftype <$> findField targetType name
-      return $ setType ty fAcc {target = eTarget}
+      fdecl <- findField targetType name
+      let ty = ftype fdecl
+      checkFieldEncapsulation name eTarget ty
+      return $ setType ty fAcc {target = eTarget'}
 
     --  E |- lhs : t
     --  isLval(lhs)
@@ -1325,6 +1484,37 @@ instance Checkable Expr where
           else return $ setType ty var{qname = qname'}
         Nothing -> tcError $ UnboundVariableError qname
 
+
+    --  e : t \in E
+    --  isLval e
+    -- ----------------------
+    --  E |- consume e : t
+    doTypecheck cons@(Consume {target}) =
+        do eTarget <- typecheck target
+           unless (isLval eTarget) $
+                  tcError $ CannotConsumeError eTarget
+           whenM (isGlobalVar eTarget) $
+                 tcError $ CannotConsumeError eTarget
+           unlessM (isMutableTarget eTarget) $
+                 tcError $ ImmutableConsumeError eTarget
+           let ty = AST.getType eTarget
+           unless (canBeNull ty || isMaybeType ty) $
+                  tcError $ CannotConsumeTypeError eTarget
+           return $ setType ty cons {target = eTarget}
+        where
+          isGlobalVar VarAccess{qname} =
+              liftM not $ asks $ isLocal qname
+          isGlobalVar _ = return False
+
+          isMutableTarget VarAccess{qname} =
+              asks $ isMutableLocal qname
+          isMutableTarget FieldAccess{target, name} = do
+              let targetType = AST.getType target
+              fdecl <- findField targetType name
+              return $ not $ isValField fdecl
+          isMutableTarget _ = return True
+
+
     --
     -- ----------------------
     --  E |- null : nullType
@@ -1362,14 +1552,17 @@ instance Checkable Expr where
     doTypecheck new@(NewWithInit {ty, args})
       | isRefAtomType ty && null (getTypeParameters ty) = do
           formal <- findFormalRefType ty
-
           header <- findConstructor formal args
           let typeParams = getTypeParameters formal
               argTypes = map ptype (hparams header)
 
           (eArgs, resolvedTy, _) <-
               inferenceCall fakeInitCall typeParams argTypes formal
-          return $ setType resolvedTy new{ty = resolvedTy, args = eArgs}
+
+          checkArgsEncapsulation eArgs resolvedTy
+
+          return $ setArrowType (arrowType argTypes unitType) $
+                   setType resolvedTy new{ty = resolvedTy, args = eArgs}
 
       | otherwise = do
           ty' <- resolveType ty
@@ -1378,7 +1571,9 @@ instance Checkable Expr where
           let expectedTypes = map ptype (hparams header)
 
           (eArgs, _) <- matchArguments args expectedTypes
-          return $ setType ty' new{ty = ty', args = eArgs}
+          checkArgsEncapsulation eArgs ty'
+          return $ setArrowType (arrowType expectedTypes unitType) $
+                   setType ty' new{ty = ty', args = eArgs}
 
       where
         findConstructor ty args = do
@@ -1641,23 +1836,34 @@ instance Checkable Expr where
 
           eLoper <- typecheck loper
           eRoper <- typecheck roper
+
           let lType = AST.getType eLoper
           let rType = AST.getType eRoper
 
-          unlessM (lType `subtypeOf` rType) $
-            unlessM (rType `subtypeOf` lType) $
-              tcError $ IdComparisonTypeMismatchError lType rType
+          eLoper' <- if isNullType lType
+                     then coerceNull eLoper rType
+                     else return eLoper
+          eRoper' <- if isNullType rType
+                     then coerceNull eRoper lType
+                     else return eRoper
 
-          unless (isTypeVar lType) $ checkIdComparisonSupport lType
-          unless (isTypeVar rType) $ checkIdComparisonSupport rType
+          let lType' = AST.getType eLoper'
+          let rType' = AST.getType eRoper'
 
-          when (isStringObjectType lType) $
+          unlessM (lType' `subtypeOf` rType') $
+            unlessM (rType' `subtypeOf` lType') $
+              tcError $ IdComparisonTypeMismatchError lType' rType'
+
+          unless (isTypeVar lType') $ checkIdComparisonSupport lType'
+          unless (isTypeVar rType') $ checkIdComparisonSupport rType'
+
+          when (isStringObjectType lType') $
             unless (isNullLiteral eRoper || isNullLiteral eLoper) $
                          tcWarning StringIdentityWarning
-          when (isTypeVar lType) $
+          when (isTypeVar lType') $
             tcWarning PolymorphicIdentityWarning
 
-          return $ setType boolType bin {loper = eLoper, roper = eRoper}
+          return $ setType boolType bin {loper = eLoper', roper = eRoper'}
       | binop `elem` arithOps = do
           checkThatResultIsUsed
 
@@ -1689,17 +1895,100 @@ instance Checkable Expr where
                 return ()
             | otherwise = do
                 id <- resolveType (refType "Id")
-                includesId <- ty `subtypeOf` id
-                unless (includesId || isPrimitive ty) $
+                includesId <- ty `includesMarkerTrait` id
+                unless (includesId || isPrimitive ty ||
+                        isNullType ty || isBottomType ty) $
                   tcError $ IdComparisonNotSupportedError ty
 
     doTypecheck e = error $ "Cannot typecheck expression " ++ show (ppExpr e)
+
+canBeNull ty =
+  isRefType ty || isFutureType ty || isArrayType ty ||
+  isStreamType ty || isCapabilityType ty || isArrowType ty || isParType ty
+
+checkEncapsulation :: Expr -> Name -> Type -> [Expr] -> TypecheckM ()
+checkEncapsulation target name returnType args = do
+  let targetType = AST.getType target
+  unless (isThisAccess target) $ do
+    checkArgsEncapsulation args targetType
+    checkReturnEncapsulation name returnType targetType
+
+checkArgsEncapsulation :: [Expr] -> Type -> TypecheckM ()
+checkArgsEncapsulation args targetType = do
+  checkSubordinateArgs args targetType
+  checkLocalArgs args targetType
+
+checkReturnEncapsulation :: Name -> Type -> Type -> TypecheckM ()
+checkReturnEncapsulation name returnType targetType = do
+  checkSubordinateReturn name returnType targetType
+  checkLocalReturn name returnType targetType
+
+checkSubordinateReturn :: Name -> Type -> Type -> TypecheckM ()
+checkSubordinateReturn name returnType targetType = do
+  subordReturn <- isSubordinateType returnType
+  targetIsEncaps <- isEncapsulatedType targetType
+  when subordReturn $
+       unless targetIsEncaps $
+              tcError $ SubordinateReturnError name returnType
+
+checkSubordinateArgs :: [Expr] -> Type -> TypecheckM ()
+checkSubordinateArgs args targetType = do
+  subordinateArgs <- filterM (isSubordinateType . AST.getType) args
+  let subordinateArg = head subordinateArgs
+  targetIsEncaps <- isEncapsulatedType targetType
+  unless (null subordinateArgs) $
+         unless targetIsEncaps $
+                tcError $ SubordinateArgumentError subordinateArg
+
+checkFieldEncapsulation :: Name -> Expr -> Type -> TypecheckM ()
+checkFieldEncapsulation name target fieldType = do
+  fieldIsSubord <- isSubordinateType fieldType
+  let targetType = AST.getType target
+  targetIsEncaps <- isEncapsulatedType targetType
+  when fieldIsSubord $
+       unless (targetIsEncaps || isThisAccess target) $
+              tcError $ SubordinateFieldError name
+
+checkLocalArgs :: [Expr] -> Type -> TypecheckM ()
+checkLocalArgs args targetType =
+  when (isActiveSingleType targetType) $ do
+    localArgs <- filterM (isLocalType . AST.getType) args
+    let localArg = head localArgs
+    unless (null localArgs) $
+      tcError $ ThreadLocalArgumentError localArg
+
+    let nonSharablePolymorphicArgs =
+          filter (any nonSharableTypeVar . typeComponents . AST.getType) args
+        nonSharableArg = head nonSharablePolymorphicArgs
+        nonSharableType =
+          head $ filter nonSharableTypeVar . typeComponents . AST.getType $
+                  nonSharableArg
+    unless (null nonSharablePolymorphicArgs) $
+      tcError $ PolymorphicArgumentSendError nonSharableArg nonSharableType
+
+    let sharedArrays = filter (\arg -> isArrayType (AST.getType arg) &&
+                                       not (isArrayLiteral arg)) args
+    unless (null sharedArrays) $
+      tcWarning SharedArrayWarning
+
+checkLocalReturn :: Name -> Type -> Type -> TypecheckM ()
+checkLocalReturn name returnType targetType =
+  when (isActiveSingleType targetType) $ do
+    localReturn <- isLocalType returnType
+    when localReturn $
+       tcError $ ThreadLocalReturnError name returnType
+    let nonSharable =
+          find nonSharableTypeVar $ typeComponents returnType
+    when (isJust nonSharable) $
+       tcError $ PolymorphicReturnError name (fromJust nonSharable)
+    when (isArrayType returnType) $
+       tcWarning SharedArrayWarning
 
 --  classLookup(ty) = _
 -- ---------------------
 --  null : ty
 coerceNull null ty
-    | isRefType ty = return $ setType ty null
+    | canBeNull ty = return $ setType ty null
     | isNullType ty = tcError NullTypeInferenceError
     | otherwise =
         tcError $ CannotBeNullError ty
@@ -1729,10 +2018,6 @@ coercedInto actual expected
   | otherwise = do
       actual `assertSubtypeOf` expected
       return actual
-  where
-    canBeNull ty =
-      isRefType ty || isFutureType ty || isArrayType ty ||
-      isStreamType ty || isArrowType ty || isParType ty
 
 --  E |- arg1 : t
 --  matchTypes(B, t1, t) = B1
@@ -1763,6 +2048,9 @@ matchArguments (arg:args) (typ:types) = do
     casted = TypedExpr{emeta=(getMeta eArg),body=eArg,ty=typ}
     eArg' = if needCast then casted else eArg
   return (eArg':eArgs, bindings')
+  (eArgs, bindings') <- local (bindTypes bindings) $
+                              matchArguments args types
+  return (eArg:eArgs, bindings')
 
 --  Note that the bindings B is implicit in the reader monad
 --
@@ -1818,8 +2106,13 @@ matchTypes expected ty
             argTypes    = getArgTypes ty
             expRes      = getResultType expected
             resTy       = getResultType ty
+        unless (ty `modeSubtypeOf` expected) $
+               tcError $ TypeMismatchError ty expected
         argBindings <- matchArgs expArgTypes argTypes
-        local (bindTypes argBindings) $ matchTypes expRes resTy
+        bindings <- local (bindTypes argBindings) $ matchTypes expRes resTy
+        let expected' = replaceTypeVars bindings expected
+        assertMatch expected' ty
+        return bindings
     | isTraitType expected   && isTraitType ty ||
       isClassType expected   && isClassType ty ||
       isTypeSynonym expected && isTypeSynonym ty = do
@@ -1859,7 +2152,7 @@ matchTypes expected ty
         result <- asks $ typeVarLookup expected
         case result of
           Just boundType -> do
-            unlessM (ty `subtypeOf` boundType) $
+            unlessM (unbox ty `subtypeOf` boundType) $
               tcError $ TypeVariableAmbiguityError expected ty boundType
             asks bindings
           Nothing -> do
@@ -1903,7 +2196,6 @@ assertSubtypeOf sub super =
         Nothing ->
             tcError $ TypeMismatchError sub super
 
-
 inferenceCall call typeParams argTypes resultType
   | isMethodCallOrMessageSend call || isFunctionCall call = do
       let uniquify = uniquifyTypeVars typeParams
@@ -1917,6 +2209,7 @@ inferenceCall call typeParams argTypes resultType
       unless (null unresolved) $
          tcError $ TypeArgumentInferenceError call (head unresolved)
 
+      assertSafeTypeArguments typeParams' typeArgs
       return (eArgs, resultType', typeArgs)
   | otherwise = error $ "Typechecker.hs: expression '" ++ show call ++ "' " ++
                         "is not a method or function call"
@@ -1944,20 +2237,19 @@ typecheckCall call formalTypeParameters argTypes resultType
               matchArguments (args call) expectedTypes
 
       let returnType = replaceTypeVars bindings uniqueResultType
+      assertSafeTypeArguments uniqueTypeParameters typeArgs'
       return (eArgs, returnType, typeArgs')
  | otherwise = error $ "Typechecker.hs: expression '" ++ show call ++ "' " ++
                         "is not a method or function call"
 
 -- Helper function for return type of method calls
-retType mcall targetType header t
-  | isSyncCall targetType = t
-  | isStreamMethodHeader header = streamType t
-  | otherwise = futureType t
-  where
-    isSyncCall targetType =
-      isThisAccess (target mcall) ||
-      isPassiveClassType targetType ||
-      isTraitType targetType -- TODO now all trait methods calls are sync
+retType mcall targetType header t = do
+  isPassive <- isPassiveType targetType
+  if isPassive || isThisAccess (target mcall)
+  then return t
+  else if isStreamMethodHeader header
+  then return $ streamType t
+  else return $ futureType t
 
 typecheckPrivateModifier target name = do
   let targetType = AST.getType target
@@ -1982,7 +2274,7 @@ typecheckParametricFun argTypes eSeqFunc
       ty <- case result of
           Just (_, ty) -> return ty
           Nothing -> tcError $ UnboundFunctionError funname
-      let formalTypeParams = getTypeParams ty
+      let formalTypeParams = getTypeParameters ty
       unless (length formalTypeParams == length actualTypeParams) $
          tcError $ WrongNumberOfFunctionTypeArgumentsError funname
                    (length formalTypeParams) (length actualTypeParams)

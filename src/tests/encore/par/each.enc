@@ -11,7 +11,7 @@ fun presetArray(size : int) : [int]
   end
 end
 
-class Main
+active class Main
   var check_arr : [bool]
   var size : int
 
@@ -26,11 +26,12 @@ class Main
   def test_setting_array() : unit
     let
       arr = presetArray(this.size)
+      check_arr = this.check_arr
     in
       each(arr) >> fun (i : int)
-                     (this.check_arr)(i) = true
+                     check_arr(i) = true
                      i
-                   end >> fun (i : int) => assertTrue((this.check_arr)(i))
+                   end >> fun (i : int) => assertTrue(check_arr(i))
     end
   end
 
